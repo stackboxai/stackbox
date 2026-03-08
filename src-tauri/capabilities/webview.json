@@ -1,0 +1,6 @@
+{
+  "identifier": "webview",
+  "description": "Inline webview",
+  "windows": ["main"],
+  "permissions": ["core:webview:allow-create-webview-window"]
+}
