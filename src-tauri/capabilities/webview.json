@@ -1,6 +1,13 @@
 {
+  "$schema": "../gen/schemas/desktop-capability.json",
   "identifier": "webview",
-  "description": "Inline webview",
+  "description": "Allows creating child webview windows for the browser pane",
   "windows": ["main"],
-  "permissions": ["core:webview:allow-create-webview-window"]
+  "permissions": [
+    "core:webview:allow-create-webview-window",
+    "core:webview:allow-set-webview-focus",
+    "core:webview:allow-webview-close",
+    "core:webview:allow-set-webview-position",
+    "core:webview:allow-set-webview-size"
+  ]
 }
