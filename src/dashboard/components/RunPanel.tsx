@@ -37,14 +37,13 @@ const CSS = `
     background: #0d0d0d;
     display: flex; flex-direction: column;
     overflow: hidden; position: relative;
-  }
-  .sbx-wrap {
-    width: 100%; height: 100%;
-    background: #0d0d0d;
-    display: flex; flex-direction: column;
-    overflow: hidden; position: relative;
     transition: opacity .2s;
-  } 
+  }
+  .sbx-term {
+    flex: 1; min-height: 0; min-width: 0;
+    overflow: hidden; cursor: text;
+    padding: 4px 0 4px 4px; box-sizing: border-box;
+  }
   .sbx-term .xterm,
   .sbx-term .xterm-viewport,
   .sbx-term .xterm-screen { background: transparent !important; }
@@ -179,14 +178,15 @@ export default function RunPanel({
         const disposable = term.onData(() => {
           disposable.dispose();
           spawnedAt = Date.now();
-          invoke("pty_spawn", { sessionId: sid, cwd: runboxCwd }).catch(() => {});
+          // pass runboxId on restart too
+          invoke("pty_spawn", { sessionId: sid, runboxId, cwd: runboxCwd }).catch(() => {});
         });
       }),
     ]).then(([a, b]) => {
       unlistenOutput = a;
       unlistenEnded  = b;
-      spawnedAt = Date.now(); // record spawn time before calling pty_spawn
-      return invoke("pty_spawn", { sessionId: sid, cwd: runboxCwd });
+      spawnedAt = Date.now();
+      return invoke("pty_spawn", { sessionId: sid, runboxId, cwd: runboxCwd });
     }).catch(err => {
       if (!gone.current) {
         term.write(`\r\n\x1b[31m[error: ${err}]\x1b[0m\r\n`);

@@ -1,6 +1,7 @@
 mod browser;
 mod db;
 mod memory;
+use notify::{Watcher, RecursiveMode, recommended_watcher, Event, EventKind};
 
 use browser::{
     browser_create, browser_destroy, browser_navigate, browser_set_bounds,
@@ -203,6 +204,7 @@ fn handle_proxy_request(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
 async fn pty_spawn(
     app: AppHandle,
     session_id: String,
+    runbox_id: String,
     cwd: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -210,24 +212,50 @@ async fn pty_spawn(
     let pair = pty_system
         .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())?;
-    let mut cmd = CommandBuilder::new(if cfg!(windows) { "powershell.exe" } else { "bash" });
+
     let resolved_cwd = expand_cwd(&cwd);
-    cmd.cwd(&resolved_cwd);
-    if cfg!(windows) {
-        cmd.args(&[
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let sys_root = std::env::var("SystemRoot")
+            .unwrap_or_else(|_| "C:\\Windows".to_string());
+        let ps_path = format!(
+            "{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", sys_root
+        );
+        let mut c = CommandBuilder::new(&ps_path);
+        c.args(&[
             "-NoLogo",
             "-NoExit",
+            "-NonInteractive",
             "-Command",
-            r#"function prompt { "~/" + (Get-Location | Split-Path -Leaf) + "> " }"#,
+            r#"function prompt { "~/" + (Split-Path -Leaf (Get-Location)) + "> " }"#,
         ]);
-    }
+        // Inherit critical Windows env vars so DLLs load correctly
+        c.env("SystemRoot",   &sys_root);
+        c.env("USERPROFILE",  std::env::var("USERPROFILE").unwrap_or_default());
+        c.env("APPDATA",      std::env::var("APPDATA").unwrap_or_default());
+        c.env("LOCALAPPDATA", std::env::var("LOCALAPPDATA").unwrap_or_default());
+        c.env("TEMP",         std::env::var("TEMP").unwrap_or_default());
+        c.env("TMP",          std::env::var("TMP").unwrap_or_default());
+        c.env("PATH",         std::env::var("PATH").unwrap_or_default());
+        c
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = CommandBuilder::new("bash");
+
+    cmd.cwd(&resolved_cwd);
+
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+
     state.sessions.lock().unwrap().insert(
         session_id.clone(),
         PtySession { writer, _master: pair.master, _child: child },
     );
+
+    // ── PTY reader thread ─────────────────────────────────────────────────
     let sid = session_id.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -240,8 +268,49 @@ async fn pty_spawn(
         }
         let _ = app.emit(&format!("pty://ended/{}", sid), ());
     });
+
+    // ── File watcher ──────────────────────────────────────────────────────
+    let db_clone  = state.db.clone();
+    let cwd_watch = resolved_cwd.clone();
+    let rb_id     = runbox_id.clone();
+    let sid_watch = session_id.clone();
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match recommended_watcher(tx) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        if watcher.watch(std::path::Path::new(&cwd_watch), RecursiveMode::Recursive).is_err() {
+            return;
+        }
+        for res in rx {
+            match res {
+                Ok(Event { kind, paths, .. }) => {
+                    let change_type = match kind {
+                        EventKind::Create(_) => "created",
+                        EventKind::Modify(_) => "modified",
+                        EventKind::Remove(_) => "deleted",
+                        _ => continue,
+                    };
+                    for path in paths {
+                        if path.to_string_lossy().contains(".git") { continue; }
+                        let _ = db::file_change_insert(
+                            &db_clone,
+                            &sid_watch,
+                            &rb_id,
+                            &path.to_string_lossy(),
+                            change_type,
+                            None,
+                        );
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     Ok(())
-}
+}       
 
 #[tauri::command]
 fn pty_write(
@@ -286,10 +355,9 @@ fn pty_kill(
 async fn memory_add(
     runbox_id:  String,
     session_id: String,
-    agent:      String,
     content:    String,
 ) -> Result<memory::Memory, String> {
-    memory::memory_add(&runbox_id, &session_id, &agent, &content).await
+    memory::memory_add(&runbox_id, &session_id,&content).await
 }
 
 #[tauri::command]
@@ -325,6 +393,7 @@ fn db_file_changes_for_runbox(
     db::file_changes_for_runbox(&state.db, &runbox_id).map_err(|e| e.to_string())
 }
 
+
 // ── worktree commands (referenced by RunboxManager) ───────────────────────────
 
 #[tauri::command]
@@ -341,11 +410,19 @@ async fn worktree_create(
         .map_err(|e| e.to_string())?;
 
     if output.status.success() {
-        Ok(worktree_path)
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+        return Ok(worktree_path);
     }
+    // Branch already exists — check it out directly
+    let output2 = tokio::process::Command::new("git")
+        .args(["worktree", "add", &worktree_path, &branch])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if output2.status.success() { Ok(worktree_path) }
+    else { Err(String::from_utf8_lossy(&output2.stderr).to_string()) }
 }
+
 
 #[tauri::command]
 async fn worktree_remove(
@@ -366,11 +443,51 @@ async fn worktree_remove(
     }
 }
 
+#[tauri::command]
+async fn open_directory_dialog(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let path = app.dialog().file().blocking_pick_folder();
+    Ok(path.map(|p| p.to_string()))
+}
+
+#[tauri::command]
+async fn check_git_repo(path: String) -> Result<(), String> {
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&expand_cwd(&path))
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if output.status.success() { Ok(()) }
+    else { Err("not a git repo".into()) }
+}
+
+#[tauri::command]
+async fn memory_delete_for_runbox(runbox_id: String) -> Result<(), String> {
+    memory::memories_delete_for_runbox(&runbox_id).await
+}
+
+#[tauri::command]
+async fn git_ignore_worktrees(repo_path: String) -> Result<(), String> {
+    let path = std::path::Path::new(&repo_path).join(".gitignore");
+    let entry = "\n.worktrees/\n";
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    if !content.contains(".worktrees/") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&path)
+            .map_err(|e| e.to_string())?;
+        use std::io::Write;
+        file.write_all(entry.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             db:       db::open().expect("failed to open stackbox db"),
@@ -399,6 +516,10 @@ pub fn run() {
             // worktree
             worktree_create,
             worktree_remove,
+            open_directory_dialog,
+            check_git_repo,
+            memory_delete_for_runbox,
+            git_ignore_worktrees,
             // browser
             browser_create,
             browser_destroy,

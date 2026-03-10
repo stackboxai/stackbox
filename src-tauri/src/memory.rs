@@ -17,7 +17,6 @@ fn memory_schema() -> Arc<Schema> {
         Field::new("id",         DataType::Utf8,    false),
         Field::new("runbox_id",  DataType::Utf8,    false),
         Field::new("session_id", DataType::Utf8,    false),
-        Field::new("agent",      DataType::Utf8,    false),
         Field::new("content",    DataType::Utf8,    false),
         Field::new("pinned",     DataType::Boolean, false),
         Field::new("timestamp",  DataType::Int64,   false),
@@ -31,7 +30,6 @@ pub struct Memory {
     pub id:         String,
     pub runbox_id:  String,
     pub session_id: String,
-    pub agent:      String,
     pub content:    String,
     pub pinned:     bool,
     pub timestamp:  i64,
@@ -93,7 +91,6 @@ fn now_ms() -> i64 {
 pub async fn memory_add(
     runbox_id: &str,
     session_id: &str,
-    agent: &str,
     content: &str,
 ) -> Result<Memory, String> {
     let id = uuid::Uuid::new_v4().to_string();
@@ -106,7 +103,6 @@ pub async fn memory_add(
             Arc::new(StringArray::from(vec![id.as_str()])),
             Arc::new(StringArray::from(vec![runbox_id])),
             Arc::new(StringArray::from(vec![session_id])),
-            Arc::new(StringArray::from(vec![agent])),
             Arc::new(StringArray::from(vec![content])),
             Arc::new(BooleanArray::from(vec![false])),
             Arc::new(Int64Array::from(vec![ts])),
@@ -122,7 +118,7 @@ pub async fn memory_add(
 
     Ok(Memory {
         id, runbox_id: runbox_id.to_string(), session_id: session_id.to_string(),
-        agent: agent.to_string(), content: content.to_string(),
+        content: content.to_string(),
         pinned: false, timestamp: ts,
     })
 }
@@ -148,7 +144,6 @@ pub async fn memories_for_runbox(runbox_id: &str) -> Result<Vec<Memory>, String>
         let ids        = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let runbox_ids = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         let sess_ids   = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        let agents     = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
         let contents   = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
         let pinneds    = batch.column(5).as_any().downcast_ref::<BooleanArray>().unwrap();
         let timestamps = batch.column(6).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -158,7 +153,6 @@ pub async fn memories_for_runbox(runbox_id: &str) -> Result<Vec<Memory>, String>
                 id:         ids.value(i).to_string(),
                 runbox_id:  runbox_ids.value(i).to_string(),
                 session_id: sess_ids.value(i).to_string(),
-                agent:      agents.value(i).to_string(),
                 content:    contents.value(i).to_string(),
                 pinned:     pinneds.value(i),
                 timestamp:  timestamps.value(i),
@@ -188,7 +182,6 @@ pub async fn memories_delete_for_runbox(runbox_id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-// ── Pin ───────────────────────────────────────────────────────────────────
 
 pub async fn memory_pin(id: &str, pinned: bool) -> Result<(), String> {
     let table = get_table().await?;
