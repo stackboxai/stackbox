@@ -399,59 +399,6 @@ fn db_file_changes_for_runbox(runbox_id: String, state: tauri::State<'_, AppStat
     db::file_changes_for_runbox(&state.db, &runbox_id).map_err(|e| e.to_string())
 }
 
-// ── Git / worktree commands ───────────────────────────────────────────────────
-
-#[tauri::command]
-async fn worktree_create(repo_path: String, worktree_path: String, branch: String) -> Result<String, String> {
-    // Check if branch already exists
-    let branch_exists = tokio::process::Command::new("git")
-        .args(["-C", &repo_path, "rev-parse", "--verify", &branch])
-        .output().await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let args: &[&str] = if branch_exists {
-        &["-C", &repo_path, "worktree", "add", &worktree_path, &branch]
-    } else {
-        &["-C", &repo_path, "worktree", "add", "-b", &branch, &worktree_path]
-    };
-
-    let out = tokio::process::Command::new("git")
-        .args(args).output().await.map_err(|e| format!("git error: {e}"))?;
-
-    if out.status.success() { Ok(worktree_path) }
-    else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
-}
-
-#[tauri::command]
-async fn worktree_remove(repo_path: String, worktree_path: String) -> Result<(), String> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", &repo_path, "worktree", "remove", "--force", &worktree_path])
-        .output().await.map_err(|e| format!("git error: {e}"))?;
-    if out.status.success() { Ok(()) }
-    else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
-}
-
-#[tauri::command]
-async fn check_git_repo(path: String) -> Result<(), String> {
-    let out = tokio::process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(&expand_cwd(&path))
-        .output().await.map_err(|e| e.to_string())?;
-    if out.status.success() { Ok(()) } else { Err("not a git repo".into()) }
-}
-
-#[tauri::command]
-async fn git_ignore_worktrees(repo_path: String) -> Result<(), String> {
-    let path    = std::path::Path::new(&repo_path).join(".gitignore");
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    if !content.contains(".worktrees/") {
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            .map_err(|e| e.to_string())?;
-        file.write_all(b"\n.worktrees/\n").map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
 
 // ── Filesystem commands ───────────────────────────────────────────────────────
 
@@ -524,7 +471,6 @@ pub fn run() {
             // DB
             db_sessions_for_runbox, db_file_changes_for_runbox,
             // Git
-            worktree_create, worktree_remove, git_ignore_worktrees, check_git_repo,
             git_memory::git_ensure, git_memory::git_log_for_runbox, git_memory::git_diff_for_commit,
             // Filesystem
             open_directory_dialog, open_in_editor, read_text_file,

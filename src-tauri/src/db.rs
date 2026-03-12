@@ -17,7 +17,6 @@ pub struct Runbox {
     pub name:         String,
     pub cwd:          String,
     pub branch:       Option<String>,
-    pub worktree_path:Option<String>,
     pub created_at:   i64,
     pub updated_at:   i64,
 }
@@ -81,7 +80,6 @@ fn migrate(conn: &Connection) -> Result<()> {
             name          TEXT NOT NULL,
             cwd           TEXT NOT NULL,
             branch        TEXT,
-            worktree_path TEXT,
             created_at    INTEGER NOT NULL,
             updated_at    INTEGER NOT NULL
         );
@@ -142,24 +140,23 @@ pub fn runbox_create(db: &Db, id: &str, name: &str, cwd: &str) -> Result<Runbox>
     )?;
     Ok(Runbox {
         id: id.to_string(), name: name.to_string(), cwd: cwd.to_string(),
-        branch: None, worktree_path: None, created_at: now, updated_at: now,
+        branch: None, created_at: now, updated_at: now,
     })
 }
 
 pub fn runbox_list(db: &Db) -> Result<Vec<Runbox>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, name, cwd, branch, worktree_path, created_at, updated_at
+        "SELECT id, name, cwd, branch, created_at, updated_at
          FROM runboxes ORDER BY created_at ASC"
     )?;
     let rows = stmt.query_map([], |r| Ok(Runbox {
-        id:            r.get(0)?,
-        name:          r.get(1)?,
-        cwd:           r.get(2)?,
-        branch:        r.get(3)?,
-        worktree_path: r.get(4)?,
-        created_at:    r.get(5)?,
-        updated_at:    r.get(6)?,
+        id:         r.get(0)?,
+        name:       r.get(1)?,
+        cwd:        r.get(2)?,
+        branch:     r.get(3)?,
+        created_at: r.get(4)?,
+        updated_at: r.get(5)?,
     }))?;
     rows.collect()
 }
@@ -179,14 +176,6 @@ pub fn runbox_delete(db: &Db, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn runbox_set_worktree(db: &Db, id: &str, branch: &str, path: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE runboxes SET branch=?1, worktree_path=?2, updated_at=?3 WHERE id=?4",
-        params![branch, path, now_ms(), id],
-    )?;
-    Ok(())
-}
 
 // ── Session CRUD ──────────────────────────────────────────────────────────
 
@@ -221,8 +210,8 @@ pub fn sessions_for_runbox(db: &Db, runbox_id: &str) -> Result<Vec<Session>> {
         pane_id:    r.get(2)?,
         agent:      r.get(3)?,
         cwd:        r.get(4)?,
-        started_at: r.get(5)?,
-        ended_at:   r.get(6)?,
+        started_at: r.get(4)?,
+        ended_at:   r.get(5)?,
         exit_code:  r.get(7)?,
         log_path:   r.get(8)?,
     }))?;
@@ -291,8 +280,8 @@ pub fn file_changes_for_runbox(db: &Db, runbox_id: &str) -> Result<Vec<FileChang
         runbox_id:   r.get(2)?,
         file_path:   r.get(3)?,
         change_type: r.get(4)?,
-        diff:        r.get(5)?,
-        timestamp:   r.get(6)?,
+        diff:        r.get(4)?,
+        timestamp:   r.get(5)?,
     }))?;
     rows.collect()
 }

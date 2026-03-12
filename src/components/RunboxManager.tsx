@@ -7,7 +7,7 @@ import MemoryPanel from "./MemoryPanel";
 
 interface Runbox {
   id: string; name: string; cwd: string;
-  worktreePath: string | null; branch: string | null;
+
 }
 
 
@@ -73,14 +73,7 @@ const IcoBrain = ({ on }: { on?: boolean }) => (
     <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/>
     <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/>
   </svg>
-);
-const IcoBranch = ({ on }: { on?: boolean }) => (
-  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-    stroke={on ? C.tealText : C.t2} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-    <line x1="6" y1="3" x2="6" y2="15"/>
-    <circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
-    <path d="M18 9a9 9 0 0 1-9 9"/>
-  </svg>
+
 );
 const IcoSidebar = ({ on }: { on?: boolean }) => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
@@ -90,9 +83,6 @@ const IcoSidebar = ({ on }: { on?: boolean }) => (
     <path d="M3 3h6v18H3z" fill={on ? "currentColor" : "none"} stroke="none"/>
   </svg>
 );
-
-
-
 const IcoOpenEditor = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
     stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -126,10 +116,6 @@ function splitLeaf(node: PaneNode, id: string, dir: SplitDir, added: TermNode): 
 function collectIds(node: PaneNode): string[] {
   if (node.type === "leaf") return [node.id];
   return [...collectIds(node.a), ...collectIds(node.b)];
-}
-function worktreeDir(repoPath: string, runboxId: string) {
-  const sep = repoPath.includes("\\") ? "\\" : "/";
-  return `${repoPath}${sep}.worktrees${sep}${runboxId}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,31 +179,18 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 //  NewRunboxModal
 // ─────────────────────────────────────────────────────────────────────────────
 function NewRunboxModal({ onSubmit, onClose }: {
-  onSubmit: (name: string, cwd: string, branch: string) => void; onClose: () => void;
+  onSubmit: (name: string, cwd: string) => void; onClose: () => void;
 }) {
-  const [name, setName] = useState("");
-  const [cwd,  setCwd]  = useState("~/");
-  const [branch, setBranch] = useState("");
-  const [isGitRepo,   setIsGitRepo]   = useState<boolean | null>(null);
-  const [checkingGit, setCheckingGit] = useState(false);
-  const [creating,    setCreating]    = useState(false);
+  const [name,    setName]    = useState("");
+  const [cwd,     setCwd]     = useState("~/");
+  const [creating, setCreating] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { setTimeout(() => nameRef.current?.focus(), 40); }, []);
-  useEffect(() => {
-    if (!cwd.trim() || cwd === "~/") { setIsGitRepo(null); return; }
-    setCheckingGit(true);
-    const t = setTimeout(async () => {
-      try   { await invoke("check_git_repo", { path: cwd.trim() }); setIsGitRepo(true); }
-      catch { setIsGitRepo(false); setBranch(""); }
-      finally { setCheckingGit(false); }
-    }, 500);
-    return () => clearTimeout(t);
-  }, [cwd]);
 
   const submit = async () => {
     if (creating) return; setCreating(true);
-    try { onSubmit(name.trim() || "untitled", cwd.trim() || "~/", branch.trim()); }
+    try { onSubmit(name.trim() || "untitled", cwd.trim() || "~/"); }
     finally { setCreating(false); }
   };
   const kd = (e: React.KeyboardEvent) => { if (e.key === "Enter") submit(); if (e.key === "Escape") onClose(); };
@@ -249,22 +222,7 @@ function NewRunboxModal({ onSubmit, onClose }: {
                 </svg>
               </button>
             </div>
-            <div style={{ marginTop: 5, minHeight: 17, fontSize: 11, fontFamily: SANS }}>
-              {checkingGit && <span style={{ color: C.t2 }}>checking git…</span>}
-              {!checkingGit && isGitRepo === true  && <span style={{ color: C.green }}>✓ git repo detected — worktree available</span>}
-              {!checkingGit && isGitRepo === false && <span style={{ color: C.t2 }}>not a git repo — stackbox will initialise one</span>}
-            </div>
           </Field>
-          {isGitRepo === true && (
-            <Field label="Branch" hint="(optional — leave blank to skip worktree)">
-              <StatefulInput value={branch} onChange={e => setBranch(e.target.value)} onKeyDown={kd} placeholder="feat/my-feature" />
-              {branch.trim() && (
-                <div style={{ marginTop: 5, fontSize: 11, color: C.t2, fontFamily: SANS }}>
-                  Worktree at <span style={{ color: C.t1 }}>.worktrees/{"<id>"}</span> on <span style={{ color: C.tealText }}>{branch}</span>
-                </div>
-              )}
-            </Field>
-          )}
           <button onClick={submit} disabled={creating}
             style={{ marginTop: 4, padding: "10px 0", background: creating ? C.bg4 : C.t0, border: "none", borderRadius: 9, color: creating ? C.t2 : C.bg0, fontSize: 13, fontWeight: 700, cursor: creating ? "default" : "pointer", fontFamily: SANS, transition: "opacity .15s" }}
             onMouseEnter={e => { if (!creating) (e.currentTarget as HTMLElement).style.opacity = ".87"; }}
@@ -332,66 +290,6 @@ function OpenInEditorBtn({ path }: { path: string }) {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  WorktreePanel
-// ─────────────────────────────────────────────────────────────────────────────
-function WorktreePanel({ runboxes, activeId, onSelect, onClose }: {
-  runboxes: Runbox[]; activeId: string | null; onSelect: (id: string) => void; onClose: () => void;
-}) {
-  const wtRunboxes = runboxes.filter(r => r.worktreePath);
-  const [width, onDragDown] = useDragResize(268, "left", 200, 520);
-
-  return (
-    <div style={{ width, flexShrink: 0, background: C.bg1, borderLeft: `1px solid ${C.border}`, display: "flex", flexDirection: "column", position: "relative", userSelect: "none" }}>
-      <div onMouseDown={onDragDown}
-        style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 4, cursor: "col-resize", zIndex: 10, transition: "background .15s" }}
-        onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = C.tealBorder}
-        onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = "transparent"} />
-      <div style={{ padding: "11px 14px 11px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <IcoBranch on />
-          <span style={{ fontSize: 12, fontWeight: 600, color: C.t1, fontFamily: SANS }}>Worktrees</span>
-          {wtRunboxes.length > 0 && (
-            <span style={{ fontSize: 10, color: C.tealText, background: C.tealDim, border: `1px solid ${C.tealBorder}`, borderRadius: 20, padding: "1px 7px", fontFamily: SANS, fontWeight: 600 }}>{wtRunboxes.length}</span>
-          )}
-        </div>
-        <button onClick={onClose} style={{ ...tbtn, fontSize: 16 }}
-          onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = C.t0}
-          onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = C.t2}>×</button>
-      </div>
-      <div style={{ flex: 1, overflowY: "auto", padding: "10px", display: "flex", flexDirection: "column", gap: 6 }}>
-        {wtRunboxes.length === 0 ? (
-          <div style={{ padding: "40px 12px", textAlign: "center" }}>
-            <div style={{ fontSize: 30, opacity: 0.05, marginBottom: 12 }}>⎇</div>
-            <div style={{ fontSize: 12, color: C.t2, lineHeight: 1.8, fontFamily: SANS }}>No worktrees yet.<br />Create a runbox with a branch name.</div>
-          </div>
-        ) : wtRunboxes.map(r => {
-          const isActive = r.id === activeId;
-          return (
-            <div key={r.id} onClick={() => onSelect(r.id)}
-              style={{ background: isActive ? C.tealDim : C.bg2, border: `1px solid ${isActive ? C.tealBorder : C.border}`, borderRadius: 10, padding: "11px 12px", cursor: "pointer", transition: "all .12s" }}
-              onMouseEnter={e => { if (!isActive) { (e.currentTarget as HTMLElement).style.background = C.bg3; (e.currentTarget as HTMLElement).style.borderColor = C.borderMd; } }}
-              onMouseLeave={e => { if (!isActive) { (e.currentTarget as HTMLElement).style.background = C.bg2; (e.currentTarget as HTMLElement).style.borderColor = C.border; } }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={isActive ? C.tealText : C.t2} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
-                </svg>
-                <span style={{ fontSize: 12, fontWeight: 600, color: isActive ? C.tealText : C.t0, fontFamily: MONO, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.branch}</span>
-                {isActive && <span style={{ fontSize: 9, color: C.tealText, background: C.tealDim, border: `1px solid ${C.tealBorder}`, borderRadius: 4, padding: "1px 6px", fontFamily: SANS, fontWeight: 700, letterSpacing: ".05em" }}>ACTIVE</span>}
-              </div>
-              <div style={{ fontSize: 11, color: C.t1, fontFamily: SANS, marginBottom: 5 }}>{r.name}</div>
-              <div style={{ fontSize: 10, color: C.t2, fontFamily: MONO, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 10 }}>{r.worktreePath}</div>
-              <div onClick={e => e.stopPropagation()}>
-                <OpenInEditorBtn path={r.worktreePath!} />
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      <div style={{ padding: "8px 14px", borderTop: `1px solid ${C.border}`, fontSize: 10, color: C.t3, fontFamily: SANS }}>Drag left edge to resize</div>
-    </div>
-  );
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Sidebar
@@ -399,7 +297,7 @@ function WorktreePanel({ runboxes, activeId, onSelect, onClose }: {
 function Sidebar({ runboxes, activeId, cwdMap, collapsed, onToggle, onSelect, onCreate, onRename, onDelete }: {
   runboxes: Runbox[]; activeId: string | null; cwdMap: Record<string, string>;
   collapsed: boolean; onToggle: () => void;
-  onSelect: (id: string) => void; onCreate: (name: string, cwd: string, branch: string) => void;
+  onSelect: (id: string) => void; onCreate: (name: string, cwd: string) => void;
   onRename: (id: string, name: string) => void; onDelete: (id: string) => void;
 }) {
   const [showModal, setShowModal] = useState(false);
@@ -413,7 +311,7 @@ function Sidebar({ runboxes, activeId, cwdMap, collapsed, onToggle, onSelect, on
     <>
       {showModal && (
         <NewRunboxModal
-          onSubmit={(n, c, b) => { onCreate(n, c, b); setShowModal(false); }}
+          onSubmit={(n, c) => { onCreate(n, c); setShowModal(false); }}
           onClose={() => setShowModal(false)} />
       )}
       <div style={{ width: collapsed ? 48 : 218, flexShrink: 0, background: C.bg1, borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", transition: "width .15s cubic-bezier(.4,0,.2,1)", overflow: "hidden" }}>
@@ -465,7 +363,7 @@ function Sidebar({ runboxes, activeId, cwdMap, collapsed, onToggle, onSelect, on
               {runboxes.length === 0 && <div style={{ padding: "20px 8px", fontSize: 11, color: C.t2, fontFamily: SANS, lineHeight: 1.7 }}>No runboxes yet.</div>}
               {runboxes.map(rb => {
                 const isOn = activeId === rb.id;
-                const liveCwd = cwdMap[rb.id] || rb.worktreePath || rb.cwd;
+                const liveCwd = cwdMap[rb.id] || rb.cwd;
                 return (
                   <div key={rb.id} onClick={() => onSelect(rb.id)}
                     onDoubleClick={() => { setRenaming(rb.id); setRenameVal(rb.name); }}
@@ -483,7 +381,7 @@ function Sidebar({ runboxes, activeId, cwdMap, collapsed, onToggle, onSelect, on
                       ) : (
                         <>
                           <div style={{ fontSize: 12, fontWeight: isOn ? 500 : 400, color: isOn ? C.tealText : C.t0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontFamily: SANS, marginBottom: 1 }}>{rb.name}</div>
-                          <div style={{ fontSize: 10, color: isOn ? "rgba(86,212,168,.4)" : C.t2, fontFamily: MONO, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{rb.branch ? `⎇ ${rb.branch}` : liveCwd}</div>
+                          <div style={{ fontSize: 10, color: isOn ? "rgba(86,212,168,.4)" : C.t2, fontFamily: MONO, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{liveCwd}</div>
                         </>
                       )}
                     </div>
@@ -555,8 +453,8 @@ function PaneTree(props: PaneTreeProps) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  TermTabBar
 // ─────────────────────────────────────────────────────────────────────────────
-function TermTabBar({ leafIds, activePane, paneCwds, runboxCwd, runboxBranch, onSelect, onNewTerm, onClose }: {
-  leafIds: string[]; activePane: string; paneCwds: Record<string, string>; runboxCwd: string; runboxBranch: string | null;
+function TermTabBar({ leafIds, activePane, paneCwds, runboxCwd, onSelect, onNewTerm, onClose }: {
+  leafIds: string[]; activePane: string; paneCwds: Record<string, string>; runboxCwd: string;
   onSelect: (id: string) => void; onNewTerm: () => void; onClose: (id: string) => void;
 }) {
   return (
@@ -586,12 +484,7 @@ function TermTabBar({ leafIds, activePane, paneCwds, runboxCwd, runboxBranch, on
         onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = C.tealText}
         onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = C.t2}>+</button>
       <div style={{ flex: 1 }} />
-      {runboxBranch && (
-        <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "0 12px", borderLeft: `1px solid ${C.border}`, flexShrink: 0 }}>
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke={C.t2} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
-          <span style={{ fontSize: 10, color: C.t2, fontFamily: MONO, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{runboxBranch}</span>
-        </div>
-      )}
+
     </div>
   );
 }
@@ -646,12 +539,12 @@ function RunboxView({ runbox, onCwdChange }: { runbox: Runbox; onCwdChange: (cwd
     setPaneRoot(prev => { const added = newLeaf(); setActivePane(added.id); return splitLeaf(prev, id, dir, added); });
   }, []);
 
-  const effectiveCwd = runbox.worktreePath || runbox.cwd;
+  const effectiveCwd = runbox.cwd;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
       <TermTabBar leafIds={leafIds} activePane={activePane} paneCwds={paneCwds}
-        runboxCwd={effectiveCwd} runboxBranch={runbox.branch}
+        runboxCwd={effectiveCwd}
         onSelect={setActivePane} onNewTerm={() => doSplit(activePane, "h")} onClose={handleClose} />
       <div ref={wrapperRef} style={{ flex: 1, display: "flex", minHeight: 0, background: C.bg0, position: "relative" }}>
         <PaneTree node={paneRoot} activePane={activePane}
@@ -817,7 +710,6 @@ export default function RunboxManager() {
   const [cwdMap,           setCwdMap]           = useState<Record<string, string>>({});
   const [browserOpen,      setBrowserOpen]      = useState(false);
   const [memoryOpen,       setMemoryOpen]       = useState(false);
-  const [worktreeOpen,     setWorktreeOpen]     = useState(false);
   const [memWidth,         setMemWidth]         = useState(320);
   const [pendingUrl,       setPendingUrl]       = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -835,24 +727,13 @@ export default function RunboxManager() {
   useEffect(() => { saveRunboxes(runboxes); }, [runboxes]);
 
   // Only one right panel open at a time (except browser which is separate)
-  const closeSidePanels = () => { setMemoryOpen(false); setWorktreeOpen(false); };
+  const closeSidePanels = () => { setMemoryOpen(false); };
 
-  const onCreate = useCallback(async (name: string, cwd: string, branch: string) => {
+  const onCreate = useCallback(async (name: string, cwd: string) => {
     const id = crypto.randomUUID();
-    let worktreePath: string | null = null;
-    if (branch.trim()) {
-      const wtPath = worktreeDir(cwd, id);
-      try {
-        await invoke<string>("worktree_create", { repoPath: cwd, worktreePath: wtPath, branch: branch.trim() });
-        worktreePath = wtPath;
-        invoke("git_ignore_worktrees", { repoPath: cwd }).catch(() => {});
-      } catch (err) {
-        alert(`Worktree setup failed:\n${err}\n\nOpening in main project directory instead.`);
-      }
-    }
-    const rb: Runbox = { id, name, cwd, worktreePath, branch: branch.trim() || null };
+    const rb: Runbox = { id, name, cwd };
     // Silently ensure git repo exists (creates shadow repo if no .git so memory pipeline works)
-    invoke("git_ensure", { cwd: worktreePath ?? cwd, runboxId: id }).catch(() => {});
+    invoke("git_ensure", { cwd, runboxId: id }).catch(() => {});
     setRunboxes(p => [...p, rb]);
     setActiveId(id);
   }, []);
@@ -862,10 +743,7 @@ export default function RunboxManager() {
 
   const onDelete = useCallback(async (id: string) => {
     const rb = runboxes.find(r => r.id === id);
-    if (rb?.worktreePath) {
-      try { await invoke("worktree_remove", { repoPath: rb.cwd, worktreePath: rb.worktreePath }); }
-      catch (e) { console.warn("worktree remove:", e); }
-    }
+
     invoke("memory_delete_for_runbox", { runboxId: id }).catch(() => {});
     setRunboxes(p => {
       const next = p.filter(r => r.id !== id);
@@ -876,7 +754,6 @@ export default function RunboxManager() {
   }, [runboxes, activeId]);
 
   const safeId       = runboxes.find(r => r.id === activeId)?.id ?? runboxes[0]?.id ?? null;
-  const hasWorktrees = runboxes.some(r => r.worktreePath);
   const activeRb     = runboxes.find(r => r.id === safeId);
 
   // Memory panel drag resize
@@ -908,15 +785,6 @@ export default function RunboxManager() {
         ─────────────────────────────────────────────────────────────────── */}
         <div style={{ position: "absolute", top: 4, right: 10, zIndex: 100, display: "flex", alignItems: "center", gap: 4 }}>
 
-          {/* Git Worktrees */}
-          <ToolBtn on={worktreeOpen} title="Git worktrees"
-            onClick={() => { const o = !worktreeOpen; closeSidePanels(); setWorktreeOpen(o); }}>
-            <IcoBranch on={worktreeOpen} />
-          </ToolBtn>
-
-          {/* Separator */}
-          <div style={{ width: 1, height: 14, background: C.border, margin: "0 1px" }} />
-
           {/* Memory */}
           <ToolBtn on={memoryOpen} title="Memory"
             onClick={() => { const o = !memoryOpen; closeSidePanels(); setMemoryOpen(o); }}>
@@ -935,7 +803,7 @@ export default function RunboxManager() {
 
         {showModal && (
           <NewRunboxModal
-            onSubmit={(n, c, b) => { onCreate(n, c, b); setShowModal(false); }}
+            onSubmit={(n, c) => { onCreate(n, c); setShowModal(false); }}
             onClose={() => setShowModal(false)} />
         )}
       </div>
@@ -946,13 +814,6 @@ export default function RunboxManager() {
       <BrowserPanel open={browserOpen} pendingUrl={pendingUrl}
         onPendingUrlConsumed={() => setPendingUrl(null)}
         onClosePanel={() => setBrowserOpen(false)} />
-
-      {/* Worktrees */}
-      {worktreeOpen && (
-        <WorktreePanel runboxes={runboxes} activeId={safeId}
-          onSelect={id => setActiveId(id)}
-          onClose={() => setWorktreeOpen(false)} />
-      )}
 
 
       {/* Memory */}
