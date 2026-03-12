@@ -5,10 +5,15 @@ description  = "Stackbox"
 authors      = ["you"]
 edition      = "2021"
 rust-version = "1.77.2"
+default-run  = "app"
 
 [lib]
 name       = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "stackbox-open"
+path = "src/bin/stackbox_open.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -20,7 +25,6 @@ tauri-plugin-dialog = "2"
 tauri-plugin-log    = "2"
 serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"
-reqwest = { version = "0.12", features = ["stream", "cookies", "rustls-tls"] }
 log                 = "0.4"
 portable-pty        = "0.8"
 tokio               = { version = "1", features = ["full"] }
@@ -36,4 +40,4 @@ arrow-array         = "=55.2.0"
 arrow-schema        = "=55.2.0"
 futures             = "0.3"
 rusqlite            = { version = "0.38.0", features = ["bundled"] }
-notify              = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }

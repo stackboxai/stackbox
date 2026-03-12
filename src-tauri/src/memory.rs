@@ -1,16 +1,30 @@
 // src-tauri/src/memory.rs
-// LanceDB — agent memory per runbox (text only, embeddings added later)
+// LanceDB — agent memory per runbox
+//
+// Schema fix: vector column is FixedSizeList<512, Float32> throughout.
+// Previously was List which caused a type mismatch when writing embeddings.
 
 use lancedb::{connect, Connection, Table};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use futures::TryStreamExt;
-use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, Int64Array, BooleanArray};
+use arrow_array::{
+    RecordBatch, RecordBatchIterator,
+    StringArray, Int64Array, BooleanArray,
+    FixedSizeListArray, Float32Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-// ── Schema ────────────────────────────────────────────────────────────────
+// ── Embedding dimension ───────────────────────────────────────────────────────
+// voyage-3-lite outputs 512-dim embeddings.
+const EMBEDDING_DIM: i32 = 512;
+
+// ── Schema ────────────────────────────────────────────────────────────────────
+// IMPORTANT: vector is FixedSizeList<512>, NOT List.
+// Both memory_add (null vector) and memory_add_with_embedding (real vector)
+// must write FixedSizeListArray — mixing types causes Arrow schema errors.
 
 fn memory_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -20,10 +34,35 @@ fn memory_schema() -> Arc<Schema> {
         Field::new("content",    DataType::Utf8,    false),
         Field::new("pinned",     DataType::Boolean, false),
         Field::new("timestamp",  DataType::Int64,   false),
+        // FixedSizeList — nullable so rows without embeddings are valid
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                EMBEDDING_DIM,
+            ),
+            true,
+        ),
     ]))
 }
 
-// ── Row type ──────────────────────────────────────────────────────────────
+/// Build a zero-filled FixedSizeListArray for memories without embeddings.
+/// No arrow_buffer dep needed. Zero vectors score near-zero in similarity
+/// search so they're naturally deprioritized — correct behavior.
+fn null_fixed_size_vector() -> Result<Arc<FixedSizeListArray>, String> {
+    let floats = Arc::new(Float32Array::from(vec![0f32; EMBEDDING_DIM as usize]));
+
+    FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        EMBEDDING_DIM,
+        floats,
+        None, // no validity mask — row is "valid" but zero-filled
+    )
+    .map(Arc::new)
+    .map_err(|e| e.to_string())
+}
+
+// ── Row type ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Memory {
@@ -35,7 +74,7 @@ pub struct Memory {
     pub timestamp:  i64,
 }
 
-// ── Connection handle ─────────────────────────────────────────────────────
+// ── Connection handle ─────────────────────────────────────────────────────────
 
 static DB: OnceCell<Connection> = OnceCell::const_new();
 
@@ -55,7 +94,7 @@ pub async fn init() -> Result<(), String> {
     let tables = conn.table_names().execute().await.map_err(|e| e.to_string())?;
     if !tables.contains(&"memories".to_string()) {
         let schema = memory_schema();
-        let batch = RecordBatch::new_empty(schema.clone());
+        let batch  = RecordBatch::new_empty(schema.clone());
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         conn.create_table("memories", reader)
             .execute()
@@ -79,6 +118,10 @@ async fn get_table() -> Result<Table, String> {
         .map_err(|e| e.to_string())
 }
 
+pub async fn get_table_public() -> Result<Table, String> {
+    get_table().await
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -86,17 +129,17 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-// ── Write ─────────────────────────────────────────────────────────────────
+// ── Write (no embedding) ──────────────────────────────────────────────────────
 
 pub async fn memory_add(
-    runbox_id: &str,
+    runbox_id:  &str,
     session_id: &str,
-    content: &str,
+    content:    &str,
 ) -> Result<Memory, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now_ms();
-
     let schema = memory_schema();
+
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -106,6 +149,7 @@ pub async fn memory_add(
             Arc::new(StringArray::from(vec![content])),
             Arc::new(BooleanArray::from(vec![false])),
             Arc::new(Int64Array::from(vec![ts])),
+            null_fixed_size_vector()?,   // ← FixedSizeList null, not ListArray
         ],
     ).map_err(|e| e.to_string())?;
 
@@ -118,12 +162,65 @@ pub async fn memory_add(
 
     Ok(Memory {
         id, runbox_id: runbox_id.to_string(), session_id: session_id.to_string(),
-        content: content.to_string(),
-        pinned: false, timestamp: ts,
+        content: content.to_string(), pinned: false, timestamp: ts,
     })
 }
 
-// ── Read ──────────────────────────────────────────────────────────────────
+// ── Write (with embedding) ────────────────────────────────────────────────────
+
+pub async fn memory_add_with_embedding(
+    runbox_id:  &str,
+    session_id: &str,
+    content:    &str,
+    embedding:  Vec<f32>,
+) -> Result<Memory, String> {
+    if embedding.len() != EMBEDDING_DIM as usize {
+        return Err(format!(
+            "embedding dimension mismatch: expected {EMBEDDING_DIM}, got {}",
+            embedding.len()
+        ));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let ts = now_ms();
+    let schema = memory_schema();
+
+    let vector_col = Arc::new(
+        FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            EMBEDDING_DIM,
+            Arc::new(Float32Array::from(embedding)),
+            None, // not null — real embedding present
+        ).map_err(|e| e.to_string())?,
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![id.as_str()])),
+            Arc::new(StringArray::from(vec![runbox_id])),
+            Arc::new(StringArray::from(vec![session_id])),
+            Arc::new(StringArray::from(vec![content])),
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(Int64Array::from(vec![ts])),
+            vector_col,
+        ],
+    ).map_err(|e| e.to_string())?;
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    get_table().await?
+        .add(reader)
+        .execute()
+        .await
+        .map_err(|e: lancedb::Error| e.to_string())?;
+
+    Ok(Memory {
+        id, runbox_id: runbox_id.to_string(), session_id: session_id.to_string(),
+        content: content.to_string(), pinned: false, timestamp: ts,
+    })
+}
+
+// ── Read ──────────────────────────────────────────────────────────────────────
 
 pub async fn memories_for_runbox(runbox_id: &str) -> Result<Vec<Memory>, String> {
     let table = get_table().await?;
@@ -144,9 +241,10 @@ pub async fn memories_for_runbox(runbox_id: &str) -> Result<Vec<Memory>, String>
         let ids        = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let runbox_ids = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         let sess_ids   = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        let contents   = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
-        let pinneds    = batch.column(5).as_any().downcast_ref::<BooleanArray>().unwrap();
-        let timestamps = batch.column(6).as_any().downcast_ref::<Int64Array>().unwrap();
+        let contents   = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        let pinneds    = batch.column(4).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let timestamps = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
+        // col 6 = vector — skip for plain reads
 
         for i in 0..batch.num_rows() {
             out.push(Memory {
@@ -164,7 +262,7 @@ pub async fn memories_for_runbox(runbox_id: &str) -> Result<Vec<Memory>, String>
     Ok(out)
 }
 
-// ── Delete ────────────────────────────────────────────────────────────────
+// ── Delete ────────────────────────────────────────────────────────────────────
 
 pub async fn memory_delete(id: &str) -> Result<(), String> {
     get_table().await?
@@ -182,6 +280,7 @@ pub async fn memories_delete_for_runbox(runbox_id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+// ── Pin ───────────────────────────────────────────────────────────────────────
 
 pub async fn memory_pin(id: &str, pinned: bool) -> Result<(), String> {
     let table = get_table().await?;
@@ -198,42 +297,50 @@ pub async fn memory_pin(id: &str, pinned: bool) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    if let Some(batch) = batches.into_iter().next() {
-        if batch.num_rows() == 0 { return Ok(()); }
+    let batch = match batches.into_iter().next() {
+        Some(b) if b.num_rows() > 0 => b,
+        _ => return Ok(()),
+    };
 
-        let ids        = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let runbox_ids = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let sess_ids   = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        let agents     = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-        let contents   = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
-        let timestamps = batch.column(6).as_any().downcast_ref::<Int64Array>().unwrap();
+    let ids        = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let runbox_ids = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let sess_ids   = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    let contents   = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    let timestamps = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
 
-        table
-            .delete(&format!("id = '{}'", id.replace('\'', "''")))
-            .await
-            .map_err(|e| e.to_string())?;
+    table
+        .delete(&format!("id = '{}'", id.replace('\'', "''")))
+        .await
+        .map_err(|e| e.to_string())?;
 
-        let schema = memory_schema();
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![ids.value(0)])),
-                Arc::new(StringArray::from(vec![runbox_ids.value(0)])),
-                Arc::new(StringArray::from(vec![sess_ids.value(0)])),
-                Arc::new(StringArray::from(vec![agents.value(0)])),
-                Arc::new(StringArray::from(vec![contents.value(0)])),
-                Arc::new(BooleanArray::from(vec![pinned])),
-                Arc::new(Int64Array::from(vec![timestamps.value(0)])),
-            ],
-        ).map_err(|e| e.to_string())?;
+    let schema = memory_schema();
 
-        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], schema);
-        get_table().await?
-            .add(reader)
-            .execute()
-            .await
-            .map_err(|e: lancedb::Error| e.to_string())?;
-    }
+    // Re-use original vector col if present, else write a fresh null
+    let vector_col: Arc<dyn arrow_array::Array> = if batch.num_columns() > 6 {
+        batch.column(6).clone()
+    } else {
+        null_fixed_size_vector()?
+    };
+
+    let new_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![ids.value(0)])),
+            Arc::new(StringArray::from(vec![runbox_ids.value(0)])),
+            Arc::new(StringArray::from(vec![sess_ids.value(0)])),
+            Arc::new(StringArray::from(vec![contents.value(0)])),
+            Arc::new(BooleanArray::from(vec![pinned])),
+            Arc::new(Int64Array::from(vec![timestamps.value(0)])),
+            vector_col,
+        ],
+    ).map_err(|e| e.to_string())?;
+
+    let reader = RecordBatchIterator::new(vec![Ok(new_batch)], schema);
+    get_table().await?
+        .add(reader)
+        .execute()
+        .await
+        .map_err(|e: lancedb::Error| e.to_string())?;
 
     Ok(())
 }

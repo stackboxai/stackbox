@@ -9,6 +9,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event"; // ← ADDED: needed for memory-added event
 
 // ── Palette — matches RunboxManager charcoal tokens ───────────────────────────
 const C = {
@@ -108,19 +109,12 @@ const DIFF_LINE_STYLES: Record<DiffLineKind, React.CSSProperties> = {
 };
 
 // ── DiffView ──────────────────────────────────────────────────────────────────
-// Renders a unified diff exactly like GitHub / git show:
-//   @@ hunk header  (blue)
-//   + added line    (green)
-//   - removed line  (red)
-//   context line    (grey)
 function DiffView({ diff, maxHeight = 420 }: { diff: string; maxHeight?: number }) {
   const lines = diff.split("\n");
-  // Track line numbers
   let oldLine = 0, newLine = 0;
   const parsed = lines.map(line => {
     const kind = classifyLine(line);
     if (kind === "hunk") {
-      // Extract starting line numbers from @@ -a,b +c,d @@
       const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
       if (m) { oldLine = parseInt(m[1]) - 1; newLine = parseInt(m[2]) - 1; }
       return { line, kind, oldN: null as number | null, newN: null as number | null };
@@ -145,15 +139,12 @@ function DiffView({ diff, maxHeight = 420 }: { diff: string; maxHeight?: number 
             const isMeta = row.kind === "meta" || row.kind === "hunk";
             return (
               <tr key={i} style={{ background: (s.background as string) ?? "transparent" }}>
-                {/* Old line number */}
                 <td style={{ padding: "0 6px", textAlign: "right", fontSize: 10, color: row.kind === "remove" ? "rgba(248,81,73,.5)" : C.t3, userSelect: "none", fontFamily: MONO, verticalAlign: "top", paddingTop: 1 }}>
                   {isMeta ? "" : (row.oldN ?? "")}
                 </td>
-                {/* New line number */}
                 <td style={{ padding: "0 6px", textAlign: "right", fontSize: 10, color: row.kind === "add" ? "rgba(63,185,80,.5)" : C.t3, userSelect: "none", fontFamily: MONO, verticalAlign: "top", paddingTop: 1, borderRight: `1px solid ${C.border}` }}>
                   {isMeta ? "" : (row.newN ?? "")}
                 </td>
-                {/* Code */}
                 <td style={{ ...s, background: "transparent", fontSize: 11.5, fontFamily: MONO, lineHeight: 1.55, padding: "0 10px", whiteSpace: "pre-wrap", wordBreak: "break-all", verticalAlign: "top" }}>
                   {row.line}
                 </td>
@@ -167,17 +158,12 @@ function DiffView({ diff, maxHeight = 420 }: { diff: string; maxHeight?: number 
 }
 
 // ── CodePeekModal ─────────────────────────────────────────────────────────────
-// Full-screen (within Stackbox) modal showing:
-//  - File path + change type badge
-//  - Full git-style diff (if available)
-//  - "Open in Editor" dropdown
 function CodePeekModal({ fc, onClose }: { fc: FileChange; onClose: () => void }) {
   const [opening,      setOpening]      = useState(false);
   const [openedEditor, setOpenedEditor] = useState<string | null>(null);
   const [showEdMenu,   setShowEdMenu]   = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // Close editor dropdown on outside click
   useEffect(() => {
     if (!showEdMenu) return;
     const h = (e: MouseEvent) => {
@@ -187,7 +173,6 @@ function CodePeekModal({ fc, onClose }: { fc: FileChange; onClose: () => void })
     return () => window.removeEventListener("mousedown", h);
   }, [showEdMenu]);
 
-  // Esc closes
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", h);
@@ -204,7 +189,6 @@ function CodePeekModal({ fc, onClose }: { fc: FileChange; onClose: () => void })
 
   const changeColor: Record<string, string> = { created: C.green, modified: C.amber, deleted: C.red };
   const cc = changeColor[fc.change_type] ?? C.t2;
-
   const fileName = fc.file_path.split(/[/\\]/).pop() ?? fc.file_path;
   const dirPart  = fc.file_path.slice(0, fc.file_path.length - fileName.length);
 
@@ -215,32 +199,21 @@ function CodePeekModal({ fc, onClose }: { fc: FileChange; onClose: () => void })
       <div
         onClick={e => e.stopPropagation()}
         style={{ width: "min(860px, 92vw)", maxHeight: "82vh", background: C.bg2, border: `1px solid ${C.borderMd}`, borderRadius: 14, boxShadow: "0 40px 100px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.05)", display: "flex", flexDirection: "column", overflow: "hidden", animation: "sbFadeUp .15s cubic-bezier(.2,1,.4,1)" }}>
-
-        {/* ── Modal header */}
         <div style={{ padding: "12px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-
-          {/* Change type badge */}
           <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: ".07em", textTransform: "uppercase", color: cc, background: `${cc}18`, border: `1px solid ${cc}33`, borderRadius: 4, padding: "2px 7px", fontFamily: SANS, flexShrink: 0 }}>
             {fc.change_type}
           </span>
-
-          {/* File path — dir muted, filename bright */}
           <div style={{ flex: 1, fontFamily: MONO, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             <span style={{ color: C.t2 }}>{dirPart}</span>
             <span style={{ color: C.t0, fontWeight: 600 }}>{fileName}</span>
           </div>
-
-          {/* Timestamp */}
           <span style={{ fontSize: 10, color: C.t2, fontFamily: SANS, flexShrink: 0 }}>{reltime(fc.timestamp)}</span>
-
-          {/* Open in Editor */}
           <div ref={menuRef} style={{ position: "relative", flexShrink: 0 }}>
             <button
               onClick={() => setShowEdMenu(v => !v)}
               style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", background: showEdMenu ? C.bg4 : C.bg3, border: `1px solid ${showEdMenu ? C.borderHi : C.border}`, borderRadius: 7, cursor: "pointer", color: opening ? C.tealText : C.t1, fontSize: 11, fontFamily: SANS, fontWeight: 500, transition: "all .12s", whiteSpace: "nowrap" }}
               onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = C.bg4; el.style.color = C.t0; el.style.borderColor = C.borderMd; }}
               onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = showEdMenu ? C.bg4 : C.bg3; el.style.color = opening ? C.tealText : C.t1; el.style.borderColor = showEdMenu ? C.borderHi : C.border; }}>
-              {/* open-in-editor icon */}
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
                 <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
@@ -250,7 +223,6 @@ function CodePeekModal({ fc, onClose }: { fc: FileChange; onClose: () => void })
                 <polyline points="6 9 12 15 18 9"/>
               </svg>
             </button>
-
             {showEdMenu && (
               <div style={{ position: "absolute", top: "calc(100% + 4px)", right: 0, background: C.bg2, border: `1px solid ${C.borderMd}`, borderRadius: 9, overflow: "hidden", boxShadow: "0 8px 28px rgba(0,0,0,.55)", minWidth: 160, zIndex: 100, animation: "sbFadeUp .1s cubic-bezier(.2,1,.4,1)" }}>
                 {([
@@ -269,19 +241,14 @@ function CodePeekModal({ fc, onClose }: { fc: FileChange; onClose: () => void })
               </div>
             )}
           </div>
-
-          {/* Close */}
           <button onClick={onClose}
             style={{ ...tbtn, fontSize: 18, marginLeft: 4 }}
             onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = C.t0}
             onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = C.t2}>×</button>
         </div>
-
-        {/* ── Diff body */}
         <div style={{ flex: 1, overflowY: "auto", padding: "14px 16px" }}>
           {fc.diff ? (
             <>
-              {/* Stats summary — like GitHub's "+X -Y" */}
               <DiffStats diff={fc.diff} />
               <div style={{ marginTop: 10 }}>
                 <DiffView diff={fc.diff} maxHeight={9999} />
@@ -305,14 +272,13 @@ function CodePeekModal({ fc, onClose }: { fc: FileChange; onClose: () => void })
   );
 }
 
-// ── DiffStats — "+18 −4" summary line like GitHub ────────────────────────────
+// ── DiffStats ─────────────────────────────────────────────────────────────────
 function DiffStats({ diff }: { diff: string }) {
   let added = 0, removed = 0;
   diff.split("\n").forEach(line => {
     if (line.startsWith("+") && !line.startsWith("+++")) added++;
     if (line.startsWith("-") && !line.startsWith("---")) removed++;
   });
-  // 5-block bar like GitHub — max 5 squares, proportional fill
   const total  = added + removed;
   const greenN = total === 0 ? 0 : Math.round((added   / total) * 5);
   const redN   = total === 0 ? 0 : Math.round((removed / total) * 5);
@@ -348,13 +314,11 @@ function FileChangeList({ runboxId }: { runboxId: string }) {
   if (loading)          return <Spinner />;
   if (!changes.length)  return <Empty text="No file changes recorded yet." />;
 
-  // Group by file path — most recent change per file shown first
   const byPath = new Map<string, FileChange[]>();
   changes.forEach(fc => {
     if (!byPath.has(fc.file_path)) byPath.set(fc.file_path, []);
     byPath.get(fc.file_path)!.push(fc);
   });
-  // Sort groups by most recent change
   const groups = [...byPath.entries()]
     .sort((a, b) => Math.max(...b[1].map(x => x.timestamp)) - Math.max(...a[1].map(x => x.timestamp)));
 
@@ -362,11 +326,8 @@ function FileChangeList({ runboxId }: { runboxId: string }) {
 
   return (
     <>
-      {/* Code Peek modal */}
       {peeking && <CodePeekModal fc={peeking} onClose={() => setPeeking(null)} />}
-
       <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-        {/* Legend */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 2px 8px", borderBottom: `1px solid ${C.border}`, marginBottom: 4 }}>
           {(["created", "modified", "deleted"] as const).map(t => (
             <div key={t} style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -377,15 +338,11 @@ function FileChangeList({ runboxId }: { runboxId: string }) {
           <span style={{ flex: 1 }} />
           <span style={{ fontSize: 10, color: C.t2, fontFamily: SANS }}>{groups.length} file{groups.length !== 1 ? "s" : ""}</span>
         </div>
-
         {groups.map(([filePath, fcs]) => {
-          // Latest change for this file
-          const latest  = fcs.sort((a, b) => b.timestamp - a.timestamp)[0];
-          const cc      = typeColor[latest.change_type] ?? C.t2;
+          const latest   = fcs.sort((a, b) => b.timestamp - a.timestamp)[0];
+          const cc       = typeColor[latest.change_type] ?? C.t2;
           const fileName = filePath.split(/[/\\]/).pop() ?? filePath;
           const dirPart  = filePath.slice(0, filePath.length - fileName.length);
-
-          // Diff stats for the latest change
           const hasDiff  = !!latest.diff;
           let added = 0, removed = 0;
           if (hasDiff) {
@@ -394,7 +351,6 @@ function FileChangeList({ runboxId }: { runboxId: string }) {
               if (l.startsWith("-") && !l.startsWith("---")) removed++;
             });
           }
-
           return (
             <div
               key={filePath}
@@ -402,11 +358,7 @@ function FileChangeList({ runboxId }: { runboxId: string }) {
               style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 8, cursor: "pointer", background: "transparent", border: `1px solid transparent`, transition: "all .12s", userSelect: "none" }}
               onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = C.bg3; el.style.borderColor = C.border; }}
               onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = "transparent"; el.style.borderColor = "transparent"; }}>
-
-              {/* Colour dot */}
               <span style={{ width: 7, height: 7, borderRadius: 2, background: cc, flexShrink: 0 }} />
-
-              {/* File name */}
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontFamily: MONO, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   <span style={{ color: C.t2, fontSize: 11 }}>{dirPart}</span>
@@ -414,18 +366,13 @@ function FileChangeList({ runboxId }: { runboxId: string }) {
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
                   <span style={{ fontSize: 10, color: C.t2, fontFamily: SANS }}>{reltime(latest.timestamp)}</span>
-                  {fcs.length > 1 && (
-                    <span style={{ fontSize: 10, color: C.t2, fontFamily: SANS }}>{fcs.length} changes</span>
-                  )}
+                  {fcs.length > 1 && <span style={{ fontSize: 10, color: C.t2, fontFamily: SANS }}>{fcs.length} changes</span>}
                 </div>
               </div>
-
-              {/* +/- stats */}
               {hasDiff && (
                 <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
                   {added   > 0 && <span style={{ fontSize: 11, fontWeight: 600, color: C.green,  fontFamily: MONO }}>+{added}</span>}
                   {removed > 0 && <span style={{ fontSize: 11, fontWeight: 600, color: C.red,    fontFamily: MONO }}>−{removed}</span>}
-                  {/* Mini 5-block bar */}
                   <div style={{ display: "flex", gap: 1.5 }}>
                     {(() => {
                       const t = added + removed;
@@ -441,8 +388,6 @@ function FileChangeList({ runboxId }: { runboxId: string }) {
                   </div>
                 </div>
               )}
-
-              {/* Peek hint */}
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={C.t3} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
                 <polyline points="9 18 15 12 9 6"/>
               </svg>
@@ -485,8 +430,8 @@ function RunboxPickerModal({ runboxes, currentId, picked, onConfirm, onClose }: 
           {runboxes.length === 0
             ? <div style={{ padding: "20px 0", textAlign: "center", fontSize: 12, color: C.t3, fontFamily: SANS }}>No other runboxes.</div>
             : runboxes.map(rb => {
-              const checked    = selected.includes(rb.id);
-              const isCurrent  = rb.id === currentId;
+              const checked   = selected.includes(rb.id);
+              const isCurrent = rb.id === currentId;
               return (
                 <div key={rb.id} onClick={() => toggle(rb.id)}
                   style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 7, cursor: "pointer", background: checked ? C.tealDim : "transparent", border: `1px solid ${checked ? C.tealBorder : C.border}`, transition: "all .12s" }}>
@@ -617,7 +562,6 @@ function AddMemoryForm({ runboxId, sessionId, runboxes, onAdded }: {
           onFocus={e => e.currentTarget.style.borderColor = C.borderHi}
           onBlur={e  => e.currentTarget.style.borderColor = C.border}
           onKeyDown={e => { if (e.key === "Escape") reset(); }} />
-
         <div>
           <div style={{ fontSize: 10, fontWeight: 600, color: C.t3, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 6, fontFamily: SANS }}>Save to</div>
           <div style={{ display: "flex", gap: 5 }}>
@@ -643,7 +587,6 @@ function AddMemoryForm({ runboxId, sessionId, runboxes, onAdded }: {
             </div>
           )}
         </div>
-
         <div style={{ display: "flex", gap: 6 }}>
           <button onClick={reset} style={{ ...tbtn, color: C.t2, padding: "6px 12px" }}>Cancel</button>
           <button onClick={submit} disabled={disabled}
@@ -733,6 +676,19 @@ export default function MemoryPanel({ runboxId, runboxName, runboxes, onClose }:
 
   useEffect(() => { loadMemories(); }, [loadMemories]);
 
+  // ── ADDED: auto-refresh when the pipeline saves a new memory ─────────────
+  // memory_pipeline.rs emits "memory-added" after every Claude extraction.
+  // No polling needed — this fires instantly when a new learning is saved.
+  useEffect(() => {
+    const unsub = listen<{ runbox_id: string }>("memory-added", ({ payload }) => {
+      if (payload.runbox_id === runboxId || payload.runbox_id === "__global__") {
+        loadMemories();
+      }
+    });
+    return () => { unsub.then(f => f()); };
+  }, [runboxId, loadMemories]);
+  // ─────────────────────────────────────────────────────────────────────────
+
   const handleDelete = useCallback(async (id: string) => {
     try { await invoke("memory_delete", { id }); setMemories(p => p.filter(m => m.id !== id)); }
     catch (e) { console.error("[memory] delete:", e); }
@@ -759,7 +715,6 @@ export default function MemoryPanel({ runboxId, runboxName, runboxes, onClose }:
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: C.bg1 }}>
-      {/* Header */}
       <div style={{ padding: "11px 14px 0", flexShrink: 0, borderBottom: `1px solid ${C.border}` }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
           <span style={{ fontSize: 13, fontWeight: 600, color: C.t0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: SANS }}>{runboxName}</span>
@@ -773,8 +728,6 @@ export default function MemoryPanel({ runboxId, runboxName, runboxes, onClose }:
           <button style={tabStyle("files")}    onClick={() => setTab("files")}>Files</button>
         </div>
       </div>
-
-      {/* Body */}
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 12px 16px" }}>
         {tab === "memories" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -788,7 +741,6 @@ export default function MemoryPanel({ runboxId, runboxName, runboxes, onClose }:
         {tab === "sessions" && <SessionList runboxId={runboxId} />}
         {tab === "files"    && <FileChangeList runboxId={runboxId} />}
       </div>
-
       <style>{`
         @keyframes spin    { to { transform: rotate(360deg); } }
         @keyframes sbFadeUp { from{opacity:0;transform:translateY(6px) scale(.98)} to{opacity:1;transform:translateY(0) scale(1)} }

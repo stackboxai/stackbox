@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 const C = {
   bg0: "#0d0d0d", bg1: "#141414", bg2: "#1a1a1a",
@@ -14,12 +15,15 @@ export interface BrowserHandle {
 }
 
 interface BrowsePanelProps {
-  paneId:       string;
-  isActive:     boolean;
-  onActivate:   () => void;
-  onClose:      (id: string) => void;
-  agentRef?:    React.MutableRefObject<BrowserHandle | null>;
-  onUrlChange?: (url: string) => void;
+  paneId:                 string;
+  isActive:               boolean;
+  onActivate:             () => void;
+  onClose:                (id: string) => void;
+  agentRef?:              React.MutableRefObject<BrowserHandle | null>;
+  onUrlChange?:           (url: string) => void;
+  // ── NEW: external URL pushed from parent (e.g. PTY URL detection) ──
+  externalUrl?:           string | null;
+  onExternalUrlConsumed?: () => void;
 }
 
 function toUrl(raw: string): string {
@@ -32,15 +36,15 @@ function toUrl(raw: string): string {
 export default function BrowsePanel({
   paneId, isActive, onActivate, onClose,
   agentRef, onUrlChange,
+  externalUrl, onExternalUrlConsumed,
 }: BrowsePanelProps) {
   const slotRef      = useRef<HTMLDivElement>(null);
   const urlRef       = useRef("https://google.com");
-  const isActiveRef  = useRef(isActive); // always current, no stale closure
+  const isActiveRef  = useRef(isActive);
   const createdRef   = useRef(false);
   const [urlInput, setUrlInput] = useState("https://google.com");
   const [loading,  setLoading]  = useState(true);
 
-  // Keep isActiveRef in sync so the creation callback can read current value
   useEffect(() => { isActiveRef.current = isActive; }, [isActive]);
 
   const getRect = useCallback(() => {
@@ -50,6 +54,33 @@ export default function BrowsePanel({
     return { x: r.left, y: r.top, width: r.width, height: r.height };
   }, []);
 
+  // ── Navigate (defined early so other effects can reference it) ─────────────
+  const navigate = useCallback(async (raw: string) => {
+    const url = toUrl(raw);
+    urlRef.current = url;
+    setUrlInput(url);
+    onUrlChange?.(url);
+    await invoke("browser_navigate", { id: paneId, url });
+  }, [paneId, onUrlChange]);
+
+  // ── Handle external URL (from PTY detection or BROWSER shim) ──────────────
+  useEffect(() => {
+    if (!externalUrl || !createdRef.current) return;
+    navigate(externalUrl);
+    onExternalUrlConsumed?.();
+  }, [externalUrl]);
+
+  // ── Listen for URL changes from native webview (url bar sync) ─────────────
+  useEffect(() => {
+    const unsub = listen<{ id: string; url: string }>("browser-url-changed", ({ payload }) => {
+      if (payload.id !== paneId) return;
+      urlRef.current = payload.url;
+      setUrlInput(payload.url);
+      onUrlChange?.(payload.url);
+    });
+    return () => { unsub.then(f => f()); };
+  }, [paneId, onUrlChange]);
+
   // ── Create webview — retries until slot has real dimensions ────────────────
   useEffect(() => {
     let alive = true;
@@ -57,25 +88,23 @@ export default function BrowsePanel({
 
     const tryCreate = async () => {
       if (!alive || createdRef.current) return;
-
       await new Promise(r => requestAnimationFrame(r));
       if (!alive) return;
-
       const rect = getRect();
       if (!rect || rect.width < 1 || rect.height < 1) {
         retryTimer = setTimeout(tryCreate, 50);
         return;
       }
-
       try {
         await invoke("browser_create", { id: paneId, url: urlRef.current, ...rect });
         if (!alive) return;
         createdRef.current = true;
         setLoading(false);
-        // ── Fix: immediately show or hide based on CURRENT isActive value ──
-        // The show/hide effect may have already fired while createdRef was still
-        // false (so it did nothing). We must call it here explicitly.
-        invoke(isActiveRef.current ? "browser_show" : "browser_hide", { id: paneId }).catch(() => {});
+        if (isActiveRef.current) {
+          invoke("browser_show", { id: paneId, ...rect }).catch(() => {});
+        } else {
+          invoke("browser_hide", { id: paneId }).catch(() => {});
+        }
       } catch (e) {
         console.error("[browser] create failed", e);
         if (alive) retryTimer = setTimeout(tryCreate, 200);
@@ -103,7 +132,9 @@ export default function BrowsePanel({
       if (!createdRef.current) return;
       const rect = getRect();
       if (!rect || rect.width < 1) return;
-      invoke("browser_set_bounds", { id: paneId, ...rect }).catch(() => {});
+      if (isActiveRef.current) {
+        invoke("browser_set_bounds", { id: paneId, ...rect }).catch(() => {});
+      }
     });
     obs.observe(slot);
     return () => obs.disconnect();
@@ -111,18 +142,14 @@ export default function BrowsePanel({
 
   // ── Show / hide when tab switches ─────────────────────────────────────────
   useEffect(() => {
-    if (!createdRef.current) return; // creation callback handles first show/hide
-    invoke(isActive ? "browser_show" : "browser_hide", { id: paneId }).catch(() => {});
-  }, [isActive, paneId]);
-
-  // ── Navigate ───────────────────────────────────────────────────────────────
-  const navigate = useCallback(async (raw: string) => {
-    const url = toUrl(raw);
-    urlRef.current = url;
-    setUrlInput(url);
-    onUrlChange?.(url);
-    await invoke("browser_navigate", { id: paneId, url });
-  }, [paneId, onUrlChange]);
+    if (!createdRef.current) return;
+    if (isActive) {
+      const rect = getRect();
+      if (rect) invoke("browser_show", { id: paneId, ...rect }).catch(() => {});
+    } else {
+      invoke("browser_hide", { id: paneId }).catch(() => {});
+    }
+  }, [isActive, paneId, getRect]);
 
   const goBack    = useCallback(() => invoke("browser_go_back",    { id: paneId }).catch(() => {}), [paneId]);
   const goForward = useCallback(() => invoke("browser_go_forward", { id: paneId }).catch(() => {}), [paneId]);
@@ -200,4 +227,3 @@ function Btn({ children, title, onClick, style }: {
       }}>{children}</button>
   );
 }
-

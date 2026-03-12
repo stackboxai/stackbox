@@ -46,7 +46,73 @@ pub async fn browser_create(
         )
         .map_err(|e| e.to_string())?;
 
-    browsers().lock().unwrap().insert(id, lbl);
+    browsers().lock().unwrap().insert(id.clone(), lbl.clone());
+
+
+    let app2 = app.clone();
+    let id2  = id.clone();
+    let lbl2 = lbl.clone();
+    std::thread::spawn(move || {
+        // Give page time to load before first injection
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        loop {
+            let wv = match app2.get_webview(&lbl2) {
+                Some(w) => w,
+                None    => break,
+            };
+
+            let script = format!(
+                r#"(function(){{
+                    // 1. URL change reporter
+                    if (!window._sbxTracking) {{
+                        window._sbxTracking = true;
+                        let _last = '';
+                        setInterval(function(){{
+                            if (location.href !== _last) {{
+                                _last = location.href;
+                                fetch(
+                                    'http://127.0.0.1:7547/url-changed?id={id}&url='
+                                    + encodeURIComponent(location.href)
+                                ).catch(function(){{}});
+                            }}
+                        }}, 600);
+                    }}
+
+                    // 2. Link interceptor — no _blank escapes
+                    if (!window._sbxLinks) {{
+                        window._sbxLinks = true;
+
+                        document.addEventListener('click', function(e) {{
+                            const a = e.target.closest('a');
+                            if (!a) return;
+                            const href = a.getAttribute('href');
+                            if (!href) return;
+                            if (href.startsWith('#')) return;
+                            if (href.startsWith('javascript')) return;
+                            if (a.target === '_blank' || a.target === '_new' || a.target === '_top') {{
+                                e.preventDefault();
+                                e.stopPropagation();
+                                window.location.href = a.href;
+                            }}
+                        }}, true);
+
+                        // 3. Block window.open — redirect inline
+                        window.open = function(url, _target, _features) {{
+                            if (url && url !== 'about:blank') {{
+                                window.location.href = url;
+                            }}
+                            return null;
+                        }};
+                    }}
+                }})();"#,
+                id = id2
+            );
+
+            let _ = wv.eval(&script);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+    });
+
     Ok(())
 }
 
@@ -101,9 +167,16 @@ pub fn browser_reload(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn browser_show(app: AppHandle, id: String) -> Result<(), String> {
+pub fn browser_show(
+    app: AppHandle,
+    id: String,
+    x: f64, y: f64,
+    width: f64, height: f64,
+) -> Result<(), String> {
     let lbl = label(&id);
     if let Some(wv) = app.get_webview(&lbl) {
+        let _ = wv.set_position(LogicalPosition::new(x, y));
+        let _ = wv.set_size(LogicalSize::new(width, height));
         let _ = wv.set_focus();
     }
     Ok(())
@@ -111,11 +184,10 @@ pub fn browser_show(app: AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn browser_hide(app: AppHandle, id: String) -> Result<(), String> {
-    // Move far offscreen — Tauri webviews have no hide() method
     let lbl = label(&id);
     if let Some(wv) = app.get_webview(&lbl) {
         let _ = wv.set_position(LogicalPosition::new(-10000.0_f64, -10000.0_f64));
         let _ = wv.set_size(LogicalSize::new(1.0_f64, 1.0_f64));
     }
     Ok(())
-}   
+}
