@@ -1,44 +1,53 @@
 // src-tauri/src/git_memory.rs
 //
-// Git-based memory + file change pipeline.
-// Replaces memory_pipeline.rs and file_watcher.rs entirely.
+// Context injection pipeline for Stackbox.
 //
 // How it works:
-//   1. On pty_spawn  → ensure git repo exists (init if not), inject context into all agent files
-//   2. On session end → run `git diff HEAD` to get what changed, save to LanceDB + rusqlite
-//   3. Memory = git log + git diff. No API key. No PTY parsing. No noise filter.
+//   1. On pty_spawn → ensure git repo exists (init shadow repo if no .git)
+//   2. On pty_spawn → inject memories + git log + memory write instruction into agent files
+//      (only writes files relevant to the detected agent kind — not all 8 every time)
+//   3. Agent writes its own memories via: POST http://localhost:7547/memory
+//   4. Files tab → git_diff_live() runs `git diff HEAD` on demand (no capturing)
 //
-// If the user has no git repo → we silently init one at ~/.stackbox/repos/<runbox_id>
-// using --separate-git-dir so their working folder stays clean.
+// Context injection uses BM25 search (via session_events FTS5) to rank memories
+// by relevance to the current task (last git commit message used as query),
+// rather than a flat newest-N truncation. Pinned memories always appear first.
 
-use crate::memory::{memory_add, memories_for_runbox};
+use crate::memory::memories_for_runbox;
+use crate::db;
 use std::sync::OnceLock;
 use tauri::AppHandle;
 
-// ── Global app handle ─────────────────────────────────────────────────────────
+// ── Memory server port (shared with lib.rs axum server) ──────────────────
+pub const MEMORY_PORT: u16 = 7547;
 
+// ── Global app handle ─────────────────────────────────────────────────────
 static GLOBAL_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
 pub fn set_app_handle(handle: AppHandle) {
     GLOBAL_APP_HANDLE.set(handle).ok();
 }
 
-fn emit_memory_added(runbox_id: &str) {
+pub fn emit_memory_added(runbox_id: &str) {
     if let Some(handle) = GLOBAL_APP_HANDLE.get() {
         use tauri::Emitter;
         let _ = handle.emit("memory-added", serde_json::json!({ "runbox_id": runbox_id }));
     }
 }
 
-fn emit_file_changed(runbox_id: &str) {
-    if let Some(handle) = GLOBAL_APP_HANDLE.get() {
-        use tauri::Emitter;
-        let _ = handle.emit("file-changed", serde_json::json!({ "runbox_id": runbox_id }));
-    }
+// ── Global DB handle — set once from lib.rs so git_memory can search events ──
+static GLOBAL_DB: OnceLock<db::Db> = OnceLock::new();
+
+pub fn set_global_db(db: db::Db) {
+    GLOBAL_DB.set(db).ok();
 }
 
-// ── Agent kind ────────────────────────────────────────────────────────────────
+fn get_db() -> Option<&'static db::Db> {
+    GLOBAL_DB.get()
+}
 
+// ── Agent kind ────────────────────────────────────────────────────────────
+// Clone is required so pty_spawn can move agent_kind into the inject spawn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentKind {
     ClaudeCode,
@@ -53,12 +62,12 @@ pub enum AgentKind {
 impl AgentKind {
     pub fn detect(cmd: &str) -> Self {
         let c = cmd.trim().to_lowercase();
-        if c.starts_with("claude")   || c.contains("claude-code")     { return Self::ClaudeCode; }
-        if c.starts_with("codex")                                      { return Self::Codex; }
-        if c.starts_with("cursor")                                     { return Self::CursorAgent; }
-        if c.starts_with("gemini")                                     { return Self::GeminiCli; }
-        if c.starts_with("copilot") || c.contains("gh copilot")       { return Self::GitHubCopilot; }
-        if c.starts_with("opencode")                                   { return Self::OpenCode; }
+        if c.contains("claude")   { return Self::ClaudeCode; }
+        if c.contains("codex")    { return Self::Codex; }
+        if c.contains("agent")    { return Self::CursorAgent; }
+        if c.contains("gemini")   { return Self::GeminiCli; }
+        if c.contains("copilot")  { return Self::GitHubCopilot; }
+        if c.contains("opencode") { return Self::OpenCode; }
         Self::Shell
     }
 
@@ -74,24 +83,20 @@ impl AgentKind {
         }
     }
 
-    pub fn launch_cmd(&self) -> Option<&'static str> {
+    pub fn launch_cmd_for(&self, ctx_file: &str) -> Option<String> {
         match self {
-            Self::ClaudeCode    => Some("claude\n"),
-            Self::Codex         => Some("codex\n"),
-            Self::CursorAgent   => Some("cursor .\n"),
-            Self::GeminiCli     => Some("gemini\n"),
-            Self::GitHubCopilot => Some("gh copilot suggest\n"),
-            Self::OpenCode      => Some("opencode\n"),
+            Self::ClaudeCode    => Some(format!("claude --append-system-prompt-file {ctx_file}\n")),
+            Self::GeminiCli     => Some("gemini\n".to_string()),
+            Self::Codex         => Some("codex\n".to_string()),
+            Self::OpenCode      => Some("opencode\n".to_string()),
+            Self::CursorAgent   => Some("agent\n".to_string()),
+            Self::GitHubCopilot => Some("gh copilot suggest\n".to_string()),
             Self::Shell         => None,
         }
     }
 }
 
-// ── Git helpers ───────────────────────────────────────────────────────────────
-
-/// Returns the git dir used for this cwd.
-/// If a real .git exists → use it.
-/// If not → use ~/.stackbox/git/<runbox_id> as a separate-git-dir.
+// ── Git helpers ───────────────────────────────────────────────────────────
 fn git_dir_for(cwd: &str, runbox_id: &str) -> String {
     let dot_git = std::path::Path::new(cwd).join(".git");
     if dot_git.exists() {
@@ -103,7 +108,6 @@ fn git_dir_for(cwd: &str, runbox_id: &str) -> String {
         .to_string()
 }
 
-/// Returns true if cwd is inside a git repo (real .git or our shadow one).
 fn has_git(cwd: &str, runbox_id: &str) -> bool {
     let dot_git = std::path::Path::new(cwd).join(".git");
     if dot_git.exists() { return true; }
@@ -111,15 +115,14 @@ fn has_git(cwd: &str, runbox_id: &str) -> bool {
     std::path::Path::new(&shadow).exists()
 }
 
-/// Run a git command.
-/// - git_dir=None  → run in cwd, let git discover the repo normally
-/// - git_dir=Some  → pass --git-dir + --work-tree, run in that git_dir
 fn git(args: &[&str], cwd: &str, git_dir: Option<&str>) -> Result<String, String> {
     let mut cmd = std::process::Command::new("git");
     if let Some(gd) = git_dir {
-        cmd.arg("--git-dir").arg(gd);
-        cmd.arg("--work-tree").arg(cwd);
-        cmd.current_dir(gd);
+        let abs_gd  = std::fs::canonicalize(gd).unwrap_or_else(|_| std::path::PathBuf::from(gd));
+        let abs_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
+        cmd.arg("--git-dir").arg(&abs_gd);
+        cmd.arg("--work-tree").arg(&abs_cwd);
+        cmd.current_dir(&abs_cwd);
     } else {
         cmd.current_dir(cwd);
     }
@@ -132,79 +135,83 @@ fn git(args: &[&str], cwd: &str, git_dir: Option<&str>) -> Result<String, String
     }
 }
 
-/// Ensure the cwd has a git repo. Creates a shadow repo if needed.
-/// Returns the git_dir to use for all subsequent commands.
 pub fn ensure_git_repo(cwd: &str, runbox_id: &str) -> Result<String, String> {
     let dot_git = std::path::Path::new(cwd).join(".git");
 
-    // Real .git directory → use as-is
     if dot_git.is_dir() {
         return Ok(dot_git.to_string_lossy().to_string());
     }
 
-    // Clean up any stray .git file left in cwd by old --separate-git-dir approach
     if dot_git.is_file() { let _ = std::fs::remove_file(&dot_git); }
 
     let shadow = git_dir_for(cwd, runbox_id);
     let shadow_head = std::path::Path::new(&shadow).join("HEAD");
 
-    // Shadow repo already fully initialised (HEAD exists) → nothing to do
     if shadow_head.exists() {
         return Ok(shadow);
     }
 
-    // Create dir only if it doesn't exist at all
     let shadow_path = std::path::Path::new(&shadow);
     if !shadow_path.exists() {
         std::fs::create_dir_all(&shadow)
             .map_err(|e| format!("mkdir shadow git: {e}"))?;
     }
 
-    // Re-init is safe on existing bare repos — it's idempotent
-    git(&["init", "--bare"], &shadow, None)
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(&shadow)
+        .output()
         .map_err(|e| format!("git init --bare: {e}"))?;
 
-    git(&["config", "core.worktree", cwd], &shadow, None)
+    std::process::Command::new("git")
+        .args(["config", "core.worktree", cwd])
+        .current_dir(&shadow)
+        .output()
         .map_err(|e| format!("git config worktree: {e}"))?;
 
-    // Stage + initial commit so HEAD exists and diffs work
-    git(&["--work-tree", cwd, "add", "-A"], &shadow, None).ok();
+    git(&["add", "-A"], cwd, Some(&shadow)).ok();
     git(
-        &["--work-tree", cwd, "commit", "--allow-empty", "-m", "stackbox: initial snapshot"],
-        &shadow,
-        None,
+        &["commit", "--allow-empty", "-m", "stackbox: initial snapshot"],
+        cwd,
+        Some(&shadow),
     ).ok();
 
     eprintln!("[git_memory] created shadow repo at {shadow} for {cwd}");
     Ok(shadow)
 }
 
-/// Get the HEAD commit hash (short).
-fn head_hash(cwd: &str, git_dir: Option<&str>) -> Option<String> {
-    git(&["rev-parse", "--short", "HEAD"], cwd, git_dir).ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
+// ── Context injection ─────────────────────────────────────────────────────
 
-// ── Phase 3: context injection ────────────────────────────────────────────────
-//
-// Writes ALL agent context files on every spawn.
-// Memory content = git log --oneline (last 50 commits) + pinned memories.
-
+/// How many pinned memories to always include regardless of BM25 ranking
+const PINNED_LIMIT:  usize = 10;
+/// How many BM25-ranked event summaries to include
+const EVENTS_LIMIT:  usize = 10;
+/// Hard cap on total memories shown (pinned + regular combined)
 const CONTEXT_TOP_N: usize = 20;
 
 pub async fn inject_context_for_agent(
     runbox_id: &str,
     cwd:       &str,
-    _agent:    &AgentKind,
+    agent:     &AgentKind,
 ) -> Result<(), String> {
+    // ── 1. Load all memories for this runbox + global memories ────────────
     let mut memories = memories_for_runbox(runbox_id).await?;
     let mut globals  = memories_for_runbox("__global__").await.unwrap_or_default();
     memories.append(&mut globals);
-    memories.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.timestamp.cmp(&a.timestamp)));
-    memories.truncate(CONTEXT_TOP_N);
 
-    // Also pull recent git log as additional context
+    // ── 2. Separate pinned from unpinned ──────────────────────────────────
+    let mut pinned: Vec<_>   = memories.iter().filter(|m|  m.pinned).cloned().collect();
+    let mut unpinned: Vec<_> = memories.iter().filter(|m| !m.pinned).cloned().collect();
+    pinned.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    unpinned.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Keep all pinned (up to cap) — they are always relevant
+    pinned.truncate(PINNED_LIMIT);
+
+    // ── 3. BM25 search over session_events to rank unpinned memories ──────
+    //
+    // Use the most recent git commit message as the search query — it's the
+    // best available signal of what the agent is currently working on.
     let git_dir = git_dir_for(cwd, runbox_id);
     let git_dir_opt: Option<&str> = if std::path::Path::new(cwd).join(".git").exists() {
         None
@@ -214,237 +221,236 @@ pub async fn inject_context_for_agent(
         None
     };
 
+    let recent_commit = git(&["log", "--oneline", "-1"], cwd, git_dir_opt).unwrap_or_default();
+    // Drop the hash prefix — keep only the commit message words
+    let search_query: String = recent_commit
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Try BM25 search if we have a DB handle and a meaningful query
+    let relevant_summaries: Vec<String> = if !search_query.is_empty() {
+        if let Some(db) = get_db() {
+            db::events_search(db, runbox_id, &search_query, EVENTS_LIMIT)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| e.summary)
+                .collect()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    // Score unpinned memories: ones whose content overlaps with BM25 results float up
+    // Simple heuristic — check if the memory content shares any words with a relevant summary
+    let relevant_words: std::collections::HashSet<String> = relevant_summaries
+        .iter()
+        .flat_map(|s| s.split_whitespace().map(|w| w.to_lowercase()))
+        .filter(|w| w.len() > 3) // skip stop-words
+        .collect();
+
+    if !relevant_words.is_empty() {
+        unpinned.sort_by(|a, b| {
+            let score_a = relevance_score(&a.content, &relevant_words);
+            let score_b = relevance_score(&b.content, &relevant_words);
+            score_b.cmp(&score_a)
+                .then_with(|| b.timestamp.cmp(&a.timestamp))
+        });
+    }
+
+    // Trim unpinned to leave room for pinned within the hard cap
+    let unpinned_limit = CONTEXT_TOP_N.saturating_sub(pinned.len());
+    unpinned.truncate(unpinned_limit);
+
+    // Final ordered list: pinned first, then ranked unpinned
+    let mut final_memories = pinned;
+    final_memories.extend(unpinned);
+
+    // ── 4. Git log ────────────────────────────────────────────────────────
     let git_log = git(
         &["log", "--oneline", "--no-merges", "-30"],
         cwd,
         git_dir_opt,
     ).unwrap_or_default();
 
-    let base = std::path::Path::new(cwd);
+    // ── 5. Build context markdown ─────────────────────────────────────────
+    let base    = std::path::Path::new(cwd);
+    let content = build_context_md(runbox_id, &final_memories, &git_log);
 
-    if memories.is_empty() && git_log.trim().is_empty() {
-        // Nothing to inject — clean up stale files
-        let _ = std::fs::remove_file(base.join(".stackbox-context.md"));
-        return Ok(());
-    }
-
-    let content = build_context_md(&memories, &git_log);
-
-    // All agent context targets — written every time
-    let targets: &[(&str, bool)] = &[
-        (".stackbox-context.md",                false),
-        ("CLAUDE.md",                           true),
-        ("AGENTS.md",                           true),
-        (".cursor/rules/stackbox.md",           false),
-        (".cursorrules",                        true),
-        ("GEMINI.md",                           true),
-        (".github/copilot-instructions.md",     true),
-        ("OPENCODE.md",                         true),
+    // ── 6. Write files ────────────────────────────────────────────────────
+    let base_targets: &[(&str, bool)] = &[
+        (".stackbox-context.md", false),
     ];
 
-    for (rel_path, preserve_existing) in targets {
+    let agent_targets: Vec<(&str, bool)> = match agent {
+        AgentKind::ClaudeCode => vec![
+            ("CLAUDE.md",                          true),   // root context (auto-loaded by claude)
+            (".claude/skills/stackbox/SKILL.md",   false),  // project skill — /stackbox or auto
+        ],
+        AgentKind::Codex => vec![
+            ("AGENTS.md",                          true),   // root context (auto-loaded by codex)
+            (".codex/skills/stackbox/SKILL.md",    false),  // codex skill dir (cursor also reads .codex)
+        ],
+        AgentKind::GeminiCli => vec![
+            ("GEMINI.md",                                  true),   // root context
+            (".gemini/skills/stackbox/SKILL.md",           false),  // gemini workspace skill
+            (".agents/skills/stackbox/SKILL.md",           false),  // .agents alias — higher precedence
+        ],
+        AgentKind::OpenCode => vec![
+            ("OPENCODE.md",                        true),
+        ],
+        AgentKind::CursorAgent => vec![
+            (".agents/skills/stackbox/SKILL.md",   false),  // primary — highest precedence in cursor
+            (".cursor/skills/stackbox/SKILL.md",   false),  // cursor-specific fallback
+        ],
+        AgentKind::GitHubCopilot => vec![
+            (".github/copilot-instructions.md",        true),   // repo-wide custom instructions
+            (".github/skills/stackbox/SKILL.md",       false),  // project skill
+        ],
+        AgentKind::Shell => vec![],
+    };
+
+    // Skill files get YAML frontmatter so agents list them under /skills
+    let skill_content = format!(
+        "---\nname: stackbox-context\ndescription: Project memory and context from Stackbox. Read this before starting any task.\n---\n\n{c}",
+        c = content
+    );
+
+    let all_targets = base_targets.iter()
+        .copied()
+        .chain(agent_targets.iter().copied());
+
+    for (rel_path, preserve_existing) in all_targets {
         let path = base.join(rel_path);
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent).ok();
             }
         }
-        let final_content = if *preserve_existing {
-            let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            merge_into_existing(&existing, &content)
+        // Gemini skill files get YAML frontmatter; everything else gets plain content
+        let raw = if rel_path.contains("/skills/stackbox/SKILL.md") {
+            skill_content.clone()
         } else {
             content.clone()
+        };
+        let final_content = if preserve_existing {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            merge_into_existing(&existing, &raw)
+        } else {
+            raw
         };
         std::fs::write(&path, final_content)
             .map_err(|e| format!("write {rel_path}: {e}"))?;
     }
 
     eprintln!(
-        "[git_memory] injected {} memories + {} git log lines → all agent files",
-        memories.len(),
-        git_log.lines().count()
+        "[git_memory] injected {} memories (query={:?}) + {} git log lines → {:?} agent",
+        final_memories.len(),
+        search_query,
+        git_log.lines().count(),
+        agent,
     );
     Ok(())
+}
+
+/// Simple word-overlap relevance score between memory content and BM25 result words.
+fn relevance_score(content: &str, relevant_words: &std::collections::HashSet<String>) -> usize {
+    content
+        .split_whitespace()
+        .filter(|w| relevant_words.contains(&w.to_lowercase()))
+        .count()
 }
 
 pub async fn inject_context(runbox_id: &str, cwd: &str) -> Result<(), String> {
     inject_context_for_agent(runbox_id, cwd, &AgentKind::Shell).await
 }
 
-// ── Phase 2: memory write via git ─────────────────────────────────────────────
-//
-// Called on session end (PTY process exits).
-// Runs: git add -A && git commit → git diff HEAD~1 HEAD → save to LanceDB + rusqlite.
-
-pub async fn commit_and_capture(
-    runbox_id:  &str,
-    session_id: &str,
-    cwd:        &str,
-    db:         &crate::db::Db,
-) {
-    let git_dir = git_dir_for(cwd, runbox_id);
-    let real_git = std::path::Path::new(cwd).join(".git").exists();
-    let git_dir_opt: Option<&str> = if real_git { None } else {
-        if std::path::Path::new(&git_dir).exists() { Some(&git_dir) } else { return; }
+// ── Context file builder ──────────────────────────────────────────────────
+fn build_context_md(runbox_id: &str, memories: &[crate::memory::Memory], git_log: &str) -> String {
+    // Build the memory-save snippet as a plain string first — avoids escaping
+    // nightmares inside the outer format! call.
+    let snippet = {
+        // Avoid single quotes inside format! (Rust 2021 reserved prefix rule).
+        // Use PowerShell hashtable syntax — no quoting issues on Windows.
+        let port = MEMORY_PORT;
+        format!(
+            "```powershell\n\
+             $body = @{{runbox_id=\"{runbox_id}\"; content=\"YOUR SUMMARY HERE\"}} | ConvertTo-Json\n\
+             Invoke-RestMethod http://localhost:{port}/memory -Method Post -ContentType \"application/json\" -Body $body\n\
+             ```",
+            runbox_id = runbox_id,
+            port      = port,
+        )
     };
 
-    // Stage everything
-    if git(&["add", "-A"], cwd, git_dir_opt).is_err() { return; }
+    let instructions = format!(
+        "## Stackbox Instructions\n\
+         \n\
+         Before starting any work:\n\
+         1. Read all memories below — they contain what previous agents did\n\
+         2. Use them as context for your work\n\
+         \n\
+         After completing each task or meaningful checkpoint:\n\
+         - Save a memory with a brief summary (1-3 sentences)\n\
+         - Include: what you did, which files changed, and any known issues\n\
+         \n\
+         {snippet}\n\
+         \n\
+         You can also query your event history:\n\
+         ```powershell\n\
+         Invoke-RestMethod \"http://localhost:{port}/events?runbox_id={runbox_id}&q=YOUR+QUERY\" | ConvertTo-Json\n\
+         ```\n",
+        snippet    = snippet,
+        port       = MEMORY_PORT,
+        runbox_id  = runbox_id,
+    );
 
-    // Check if there's anything to commit
-    let status = git(&["status", "--porcelain"], cwd, git_dir_opt)
-        .unwrap_or_default();
-    if status.trim().is_empty() {
-        eprintln!("[git_memory] nothing changed — skipping commit for {runbox_id}");
-        return;
-    }
-
-    // Commit
-    let msg = format!("stackbox: session {}", &session_id[..session_id.len().min(8)]);
-    if git(&["commit", "-m", &msg], cwd, git_dir_opt).is_err() {
-        return;
-    }
-
-    let hash = head_hash(cwd, git_dir_opt).unwrap_or_else(|| "unknown".to_string());
-    eprintln!("[git_memory] committed {hash} for runbox {runbox_id}");
-
-    // Get the diff for this commit
-    let diff = git(&["diff", "HEAD~1", "HEAD"], cwd, git_dir_opt)
-        .unwrap_or_default();
-
-    if diff.trim().is_empty() { return; }
-
-    // Save file changes to rusqlite (for the Files tab in MemoryPanel)
-    save_diff_to_db(&diff, session_id, runbox_id, db);
-
-    // Save a memory: what changed in this session (git log one-liner style)
-    let summary = git(
-        &["log", "--oneline", "-1"],
-        cwd,
-        git_dir_opt,
-    ).unwrap_or_default();
-
-    let changed_files: Vec<&str> = diff
-        .lines()
-        .filter(|l| l.starts_with("diff --git"))
-        .map(|l| l.split(" b/").nth(1).unwrap_or(""))
-        .filter(|s| !s.is_empty())
-        .take(5)
-        .collect();
-
-    if !changed_files.is_empty() {
-        let content = if changed_files.len() == 1 {
-            format!("Modified {} — {}", changed_files[0], summary.trim())
-        } else {
-            format!(
-                "Modified {} files ({}) — {}",
-                changed_files.len(),
-                changed_files.join(", "),
-                summary.trim()
-            )
-        };
-
-        if let Ok(_mem) = memory_add(runbox_id, session_id, &content).await {
-            emit_memory_added(runbox_id);
-        }
-    }
-
-    emit_file_changed(runbox_id);
-}
-
-// ── Save diff lines to rusqlite file_changes ──────────────────────────────────
-
-fn save_diff_to_db(
-    diff:       &str,
-    session_id: &str,
-    runbox_id:  &str,
-    db:         &crate::db::Db,
-) {
-    // Split unified diff into per-file chunks
-    let mut current_file: Option<String> = None;
-    let mut current_diff = String::new();
-
-    for line in diff.lines() {
-        if line.starts_with("diff --git") {
-            // Flush previous file
-            if let Some(ref path) = current_file {
-                let change_type = detect_change_type(&current_diff);
-                let _ = crate::db::file_change_insert(
-                    db, session_id, runbox_id,
-                    path, change_type,
-                    Some(current_diff.trim()),
-                );
-            }
-            // Start new file — extract path from "diff --git a/foo b/foo"
-            current_file = line.split(" b/").nth(1).map(|s| s.to_string());
-            current_diff = line.to_string() + "\n";
-        } else if current_file.is_some() {
-            current_diff.push_str(line);
-            current_diff.push('\n');
-        }
-    }
-
-    // Flush last file
-    if let Some(ref path) = current_file {
-        if !current_diff.trim().is_empty() {
-            let change_type = detect_change_type(&current_diff);
-            let _ = crate::db::file_change_insert(
-                db, session_id, runbox_id,
-                path, change_type,
-                Some(current_diff.trim()),
-            );
-        }
-    }
-}
-
-fn detect_change_type(diff: &str) -> &'static str {
-    if diff.contains("new file mode")     { "created"  }
-    else if diff.contains("deleted file") { "deleted"  }
-    else                                  { "modified" }
-}
-
-// ── Context file builder ──────────────────────────────────────────────────────
-
-fn build_context_md(memories: &[crate::memory::Memory], git_log: &str) -> String {
-    let mem_section = if memories.is_empty() {
-        "*No memories yet.*\n".to_string()
+    let memories_section = if memories.is_empty() {
+        String::new()
     } else {
-        memories.iter().map(|m| {
+        let entries: String = memories.iter().map(|m| {
             let pin = if m.pinned { " 📌" } else { "" };
-            format!("- {}{}\n", m.content.trim(), pin)
-        }).collect()
+            let ts  = format_ts(m.timestamp);
+            format!("- [{}]{} {}\n", ts, pin, m.content.trim())
+        }).collect();
+        format!("## Memories from previous sessions\n\n{entries}\n")
     };
 
     let git_section = if git_log.trim().is_empty() {
-        "*No commits yet.*\n".to_string()
+        String::new()
     } else {
-        git_log.lines()
+        let entries: String = git_log.lines()
             .map(|l| format!("- {l}\n"))
-            .collect()
+            .collect();
+        format!("## Recent git commits\n\n{entries}\n")
     };
 
     format!(
-        "# Stackbox Memory Context\n\
-         > Auto-generated. Updated on every session start.\n\
-         > Edit your own content OUTSIDE the stackbox markers.\n\
+        "# Stackbox Context\n\
+         > Auto-generated by Stackbox. Updated on every session start.\n\
+         > Do not edit this block — put your own notes outside the stackbox markers.\n\
          \n\
-         ## Session memories ({count})\n\
-         \n\
-         {mem_section}\n\
-         ## Recent git history\n\
-         \n\
-         {git_section}\n\
-         ## Instructions\n\
-         Read the above before starting work. \
-         Memories capture architecture decisions, bugs, and patterns from previous sessions. \
-         Git history shows what was changed and when.\n\
-         \n\
+         {instructions}\n\
+         {memories_section}\
+         {git_section}\
          ---\n\
-         *Managed by Stackbox*\n",
-        count      = memories.len(),
-        mem_section = mem_section,
-        git_section = git_section,
+         *Managed by Stackbox — stackbox.dev*\n"
     )
+}
+
+fn format_ts(ms: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let diff = (now - ms).max(0) / 1000;
+    if diff < 60        { return "just now".to_string(); }
+    if diff < 3600      { return format!("{}m ago", diff / 60); }
+    if diff < 86400     { return format!("{}h ago", diff / 3600); }
+    format!("{}d ago", diff / 86400)
 }
 
 fn merge_into_existing(existing: &str, new_block: &str) -> String {
@@ -464,32 +470,36 @@ fn merge_into_existing(existing: &str, new_block: &str) -> String {
     }
 }
 
-// ── Tauri commands ────────────────────────────────────────────────────────────
+// ── Live diff helpers ─────────────────────────────────────────────────────
+fn git_dir_opt_for(cwd: &str, runbox_id: &str) -> Option<String> {
+    if std::path::Path::new(cwd).join(".git").exists() {
+        return None;
+    }
+    let shadow = git_dir_for(cwd, runbox_id);
+    if std::path::Path::new(&shadow).exists() {
+        Some(shadow)
+    } else {
+        None
+    }
+}
 
-/// Ensure git exists for a cwd. Called from frontend on runbox create.
-/// Returns whether a shadow repo was created (false = real .git found).
+// ── Tauri commands ────────────────────────────────────────────────────────
 #[tauri::command]
 pub async fn git_ensure(cwd: String, runbox_id: String) -> Result<bool, String> {
     let had_git = has_git(&cwd, &runbox_id);
     ensure_git_repo(&cwd, &runbox_id)?;
-    Ok(!had_git) // true = we created a new repo
+    Ok(!had_git)
 }
 
-/// Get git log for a runbox — used by MemoryPanel git history tab.
 #[tauri::command]
 pub async fn git_log_for_runbox(cwd: String, runbox_id: String) -> Result<Vec<GitCommit>, String> {
-    let git_dir = git_dir_for(&cwd, &runbox_id);
-    let real_git = std::path::Path::new(&cwd).join(".git").exists();
-    let git_dir_opt: Option<&str> = if real_git { None } else {
-        if std::path::Path::new(&git_dir).exists() { Some(git_dir.as_str()) } else {
-            return Ok(vec![]);
-        }
-    };
+    let git_dir_opt = git_dir_opt_for(&cwd, &runbox_id);
+    let gdo: Option<&str> = git_dir_opt.as_deref();
 
     let log = git(
         &["log", "--pretty=format:%H|%h|%s|%ai|%an", "--no-merges", "-50"],
         &cwd,
-        git_dir_opt,
+        gdo,
     ).unwrap_or_default();
 
     let commits = log.lines()
@@ -498,11 +508,11 @@ pub async fn git_log_for_runbox(cwd: String, runbox_id: String) -> Result<Vec<Gi
             let parts: Vec<&str> = l.splitn(5, '|').collect();
             if parts.len() < 5 { return None; }
             Some(GitCommit {
-                hash:      parts[0].to_string(),
+                hash:       parts[0].to_string(),
                 short_hash: parts[1].to_string(),
-                message:   parts[2].to_string(),
-                date:      parts[3].to_string(),
-                author:    parts[4].to_string(),
+                message:    parts[2].to_string(),
+                date:       parts[3].to_string(),
+                author:     parts[4].to_string(),
             })
         })
         .collect();
@@ -510,26 +520,133 @@ pub async fn git_log_for_runbox(cwd: String, runbox_id: String) -> Result<Vec<Gi
     Ok(commits)
 }
 
-/// Get git diff for a specific commit — used by MemoryPanel diff view.
 #[tauri::command]
 pub async fn git_diff_for_commit(
     cwd:       String,
     runbox_id: String,
     hash:      String,
 ) -> Result<String, String> {
-    let git_dir = git_dir_for(&cwd, &runbox_id);
-    let real_git = std::path::Path::new(&cwd).join(".git").exists();
-    let git_dir_opt: Option<&str> = if real_git { None } else {
-        if std::path::Path::new(&git_dir).exists() { Some(git_dir.as_str()) } else {
-            return Ok(String::new());
-        }
-    };
+    let git_dir_opt = git_dir_opt_for(&cwd, &runbox_id);
+    let gdo: Option<&str> = git_dir_opt.as_deref();
+    git(&["diff", &format!("{hash}~1"), &hash], &cwd, gdo)
+}
 
-    git(
-        &["diff", &format!("{hash}~1"), &hash],
-        &cwd,
-        git_dir_opt,
-    )
+// ── Filesystem mtime helper ───────────────────────────────────────────────────
+fn mtime_ms(cwd: &str, rel_path: &str) -> u64 {
+    use std::time::UNIX_EPOCH;
+    let full = std::path::Path::new(cwd).join(rel_path);
+    std::fs::metadata(&full)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Live diff of uncommitted changes — used by the Files tab.
+/// Returns uncommitted file changes. Does NOT run git add -A — never mutates the index.
+#[tauri::command]
+pub async fn git_diff_live(
+    cwd:       String,
+    runbox_id: String,
+) -> Result<Vec<LiveDiffFile>, String> {
+    let git_dir_opt = git_dir_opt_for(&cwd, &runbox_id);
+    let gdo: Option<&str> = git_dir_opt.as_deref();
+
+    // 1. Diff against HEAD (repo has at least one commit — most common case)
+    let mut diff    = git(&["diff", "HEAD"],              &cwd, gdo).unwrap_or_default();
+    let mut numstat = git(&["diff", "HEAD", "--numstat"], &cwd, gdo).unwrap_or_default();
+
+    // 2. Nothing vs HEAD — try staged-only (new repo, first commit not yet made)
+    if diff.trim().is_empty() {
+        diff    = git(&["diff", "--cached"],               &cwd, gdo).unwrap_or_default();
+        numstat = git(&["diff", "--cached", "--numstat"],  &cwd, gdo).unwrap_or_default();
+    }
+
+    // 3. Still empty — show untracked files as "created" via git status
+    if diff.trim().is_empty() {
+        let status = git(&["status", "--porcelain"], &cwd, gdo).unwrap_or_default();
+        let files: Vec<LiveDiffFile> = status.lines()
+            .filter(|l| l.trim_start().starts_with("??"))
+            .map(|l| {
+                let path = l.trim_start_matches("??").trim().to_string();
+                LiveDiffFile {
+                    path:        path.clone(),
+                    change_type: "created".to_string(),
+                    diff:        format!("diff --git a/{path} b/{path}\nnew file (untracked — stage to see diff)"),
+                    insertions:  0,
+                    deletions:   0,
+                    modified_at: mtime_ms(&cwd, &path),
+                }
+            })
+            .collect();
+        return Ok(files);
+    }
+
+    Ok(parse_diff_into_files(&diff, &numstat, &cwd))
+}
+
+fn parse_diff_into_files(diff: &str, numstat: &str, cwd: &str) -> Vec<LiveDiffFile> {
+    // Build stat map from numstat — format is: "additions\tdeletions\tpath"
+    // This is immune to the path truncation that --stat does.
+    let mut stat_map: std::collections::HashMap<String, (i32, i32)> = std::collections::HashMap::new();
+    for line in numstat.lines() {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() == 3 {
+            let ins = parts[0].parse::<i32>().unwrap_or(0);
+            let del = parts[1].parse::<i32>().unwrap_or(0);
+            stat_map.insert(parts[2].to_string(), (ins, del));
+        }
+    }
+
+    let mut files: Vec<LiveDiffFile> = Vec::new();
+    let mut current_path = String::new();
+    let mut current_diff = String::new();
+    let mut change_type  = "modified";
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git") {
+            if !current_path.is_empty() {
+                let (ins, del) = stat_map.get(&current_path).copied().unwrap_or((0, 0));
+                files.push(LiveDiffFile {
+                    path:        current_path.clone(),
+                    change_type: change_type.to_string(),
+                    diff:        current_diff.clone(),
+                    insertions:  ins,
+                    deletions:   del,
+                    modified_at: mtime_ms(cwd, &current_path),
+                });
+            }
+            current_path = line.split(" b/").nth(1).unwrap_or("").to_string();
+            current_diff = line.to_string() + "\n";
+            change_type  = "modified";
+        } else if line.starts_with("new file mode") {
+            change_type = "created";
+            current_diff.push_str(line);
+            current_diff.push('\n');
+        } else if line.starts_with("deleted file mode") {
+            change_type = "deleted";
+            current_diff.push_str(line);
+            current_diff.push('\n');
+        } else if !current_path.is_empty() {
+            current_diff.push_str(line);
+            current_diff.push('\n');
+        }
+    }
+
+    if !current_path.is_empty() && !current_diff.trim().is_empty() {
+        let (ins, del) = stat_map.get(&current_path).copied().unwrap_or((0, 0));
+        files.push(LiveDiffFile {
+            path:        current_path.clone(),
+            change_type: change_type.to_string(),
+            diff:        current_diff,
+            insertions:  ins,
+            deletions:   del,
+            modified_at: mtime_ms(cwd, &current_path),
+        });
+    }
+
+    files
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -539,4 +656,14 @@ pub struct GitCommit {
     pub message:    String,
     pub date:       String,
     pub author:     String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct LiveDiffFile {
+    pub path:        String,
+    pub change_type: String,  // "created" | "modified" | "deleted"
+    pub diff:        String,
+    pub insertions:  i32,
+    pub deletions:   i32,
+    pub modified_at: u64,     // Unix ms — filesystem mtime, 0 if unavailable
 }

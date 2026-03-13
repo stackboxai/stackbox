@@ -1,9 +1,10 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import RunPanel    from "./RunPanel";
-import BrowserPane from "./BrowsePanel";
-import MemoryPanel from "./MemoryPanel";
+import RunPanel          from "./RunPanel";
+import BrowserPane       from "./BrowsePanel";
+import MemoryPanel       from "./MemoryPanel";
+import { FileChangeList } from "./FileChangeList";
 
 interface Runbox {
   id: string; name: string; cwd: string;
@@ -89,6 +90,16 @@ const IcoOpenEditor = () => (
     <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
     <polyline points="15 3 21 3 21 9"/>
     <line x1="10" y1="14" x2="21" y2="3"/>
+  </svg>
+);
+const IcoFiles = ({ on }: { on?: boolean }) => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+    stroke={on ? C.tealText : C.t2} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+    <line x1="16" y1="13" x2="8" y2="13"/>
+    <line x1="16" y1="17" x2="8" y2="17"/>
+    <polyline points="10 9 9 9 8 9"/>
   </svg>
 );
 
@@ -451,40 +462,186 @@ function PaneTree(props: PaneTreeProps) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  TermTabBar
+//  Diff tab types
 // ─────────────────────────────────────────────────────────────────────────────
-function TermTabBar({ leafIds, activePane, paneCwds, runboxCwd, onSelect, onNewTerm, onClose }: {
+interface DiffTab {
+  id:          string;
+  path:        string;   // full file path — used as label
+  diff:        string;
+  changeType:  string;   // "created" | "modified" | "deleted"
+  insertions:  number;
+  deletions:   number;
+  openedAt:    number;   // ms timestamp
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Diff helpers (inline — no external import needed)
+// ─────────────────────────────────────────────────────────────────────────────
+type DiffLineKind = "add" | "remove" | "hunk" | "meta" | "context";
+
+function classifyDiffLine(l: string): DiffLineKind {
+  if (l.startsWith("+++") || l.startsWith("---") || l.startsWith("diff ") ||
+      l.startsWith("index ") || l.startsWith("new file") || l.startsWith("deleted file")) return "meta";
+  if (l.startsWith("@@"))  return "hunk";
+  if (l.startsWith("+"))   return "add";
+  if (l.startsWith("-"))   return "remove";
+  return "context";
+}
+
+const DIFF_BG: Record<DiffLineKind, string> = {
+  add: "rgba(63,185,80,.07)", remove: "rgba(248,81,73,.07)",
+  hunk: "rgba(88,166,255,.07)", meta: "transparent", context: "transparent",
+};
+const DIFF_FG: Record<DiffLineKind, string> = {
+  add: C.green, remove: C.redBright, hunk: C.blue, meta: C.t2, context: C.t1,
+};
+const DIFF_BORDER: Record<DiffLineKind, string> = {
+  add: C.green, remove: C.redBright, hunk: C.blue, meta: "transparent", context: "transparent",
+};
+
+function parseDiffLines(diff: string) {
+  let oldLine = 0, newLine = 0;
+  return diff.split("\n").map(raw => {
+    const kind = classifyDiffLine(raw);
+    if (kind === "hunk") {
+      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { oldLine = parseInt(m[1]) - 1; newLine = parseInt(m[2]) - 1; }
+      return { raw, kind, oldNum: null as number | null, newNum: null as number | null };
+    }
+    if (kind === "add")     { newLine++; return { raw, kind, oldNum: null,    newNum: newLine }; }
+    if (kind === "remove")  { oldLine++; return { raw, kind, oldNum: oldLine, newNum: null    }; }
+    if (kind === "context") { oldLine++; newLine++; return { raw, kind, oldNum: oldLine, newNum: newLine }; }
+    return { raw, kind, oldNum: null, newNum: null };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DiffTabView — full unified diff rendered in the main content area
+// ─────────────────────────────────────────────────────────────────────────────
+function DiffTabView({ tab }: { tab: DiffTab }) {
+  const lines = parseDiffLines(tab.diff);
+  const fileName = tab.path.split(/[/\\]/).pop() ?? tab.path;
+  const dirPart  = tab.path.slice(0, tab.path.length - fileName.length);
+  const cc = tab.changeType === "created" ? C.green : tab.changeType === "deleted" ? C.redBright : C.amber;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: C.bg0, overflow: "hidden" }}>
+      {/* Header bar */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 16px", borderBottom: `1px solid ${C.border}`, flexShrink: 0, background: C.bg1 }}>
+        <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: ".07em", textTransform: "uppercase", color: cc, background: `${cc}18`, border: `1px solid ${cc}33`, borderRadius: 3, padding: "2px 6px", fontFamily: SANS, flexShrink: 0 }}>
+          {tab.changeType}
+        </span>
+        <span style={{ fontFamily: MONO, fontSize: 12, color: C.t2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {dirPart}
+        </span>
+        <span style={{ fontFamily: MONO, fontSize: 12, fontWeight: 600, color: C.t0 }}>
+          {fileName}
+        </span>
+        <span style={{ flex: 1 }} />
+        {tab.insertions > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: C.green,    fontFamily: MONO }}>+{tab.insertions}</span>}
+        {tab.deletions  > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: C.redBright, fontFamily: MONO }}>−{tab.deletions}</span>}
+        <span style={{ fontSize: 10, color: C.t3, fontFamily: SANS }}>{reltime(tab.openedAt)}</span>
+      </div>
+
+      {/* Diff content */}
+      <div style={{ flex: 1, overflow: "auto" }}>
+        {!tab.diff.trim() ? (
+          <div style={{ padding: "48px 0", textAlign: "center", color: C.t2, fontSize: 12, fontFamily: SANS }}>
+            {tab.changeType === "deleted" ? "File deleted — no content to show." : "No diff captured."}
+          </div>
+        ) : (
+          <table style={{ borderCollapse: "collapse", width: "100%", tableLayout: "fixed" }}>
+            <colgroup>
+              <col style={{ width: 48 }} />
+              <col style={{ width: 48 }} />
+              <col />
+            </colgroup>
+            <tbody>
+              {lines.map((row, i) => {
+                const isMeta = row.kind === "meta" || row.kind === "hunk";
+                return (
+                  <tr key={i} style={{ background: DIFF_BG[row.kind] }}>
+                    <td style={{ padding: "0 6px", textAlign: "right", fontSize: 10, color: row.kind === "remove" ? "rgba(248,81,73,.4)" : C.t3, userSelect: "none", fontFamily: MONO, verticalAlign: "top", paddingTop: 2 }}>
+                      {isMeta ? "" : (row.oldNum ?? "")}
+                    </td>
+                    <td style={{ padding: "0 6px", textAlign: "right", fontSize: 10, color: row.kind === "add" ? "rgba(63,185,80,.4)" : C.t3, userSelect: "none", fontFamily: MONO, verticalAlign: "top", paddingTop: 2, borderRight: `1px solid ${C.border}` }}>
+                      {isMeta ? "" : (row.newNum ?? "")}
+                    </td>
+                    <td style={{ paddingLeft: 12, paddingRight: 8, borderLeft: `3px solid ${DIFF_BORDER[row.kind]}`, fontSize: 12.5, color: DIFF_FG[row.kind], fontFamily: MONO, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-all", verticalAlign: "top", fontStyle: row.kind === "hunk" ? "italic" : "normal" }}>
+                      {row.raw}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TermTabBar — terminals + diff tabs mixed
+// ─────────────────────────────────────────────────────────────────────────────
+function TermTabBar({ leafIds, activePane, paneCwds, runboxCwd, diffTabs, onSelect, onNewTerm, onClose, onCloseDiff }: {
   leafIds: string[]; activePane: string; paneCwds: Record<string, string>; runboxCwd: string;
-  onSelect: (id: string) => void; onNewTerm: () => void; onClose: (id: string) => void;
+  diffTabs: DiffTab[];
+  onSelect: (id: string) => void; onNewTerm: () => void;
+  onClose: (id: string) => void; onCloseDiff: (id: string) => void;
 }) {
   return (
     <div style={{ display: "flex", alignItems: "stretch", height: 35, flexShrink: 0, background: C.bg1, borderBottom: `1px solid ${C.border}`, overflowX: "auto", overflowY: "hidden" }}>
+      {/* Terminal tabs */}
       {leafIds.map(id => {
         const isActive = id === activePane;
-        const cwd = paneCwds[id] || runboxCwd;
+        const cwd   = paneCwds[id] || runboxCwd;
         const label = cwd.split(/[/\\]/).filter(Boolean).pop() || cwd;
         return (
           <div key={id} onClick={() => onSelect(id)}
             style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 10px 0 12px", minWidth: 90, maxWidth: 160, cursor: "pointer", flexShrink: 0, background: isActive ? C.bg0 : "transparent", borderRight: `1px solid ${C.border}`, borderBottom: isActive ? `2px solid ${C.teal}` : "2px solid transparent", transition: "background .1s" }}
             onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.background = C.bg2; }}
             onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.background = "transparent"; }}>
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={isActive ? C.tealText : C.t2} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={isActive ? C.tealText : C.t2} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+              <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+            </svg>
             <span style={{ fontSize: 11, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: isActive ? C.t0 : C.t2, fontFamily: MONO }}>{label}</span>
             {leafIds.length > 1 && (
               <button onClick={e => { e.stopPropagation(); onClose(id); }}
                 style={{ ...tbtn, fontSize: 12, opacity: isActive ? 0.5 : 0, padding: "0 1px", flexShrink: 0 }}
-                onMouseEnter={e => { (e.currentTarget as HTMLElement).style.opacity = "1"; (e.currentTarget as HTMLElement).style.color = C.red; }}
+                onMouseEnter={e => { (e.currentTarget as HTMLElement).style.opacity = "1"; (e.currentTarget as HTMLElement).style.color = C.redBright; }}
                 onMouseLeave={e => { (e.currentTarget as HTMLElement).style.opacity = isActive ? "0.5" : "0"; (e.currentTarget as HTMLElement).style.color = C.t2; }}>×</button>
             )}
           </div>
         );
       })}
+
+      {/* Diff tabs */}
+      {diffTabs.map(dt => {
+        const isActive  = dt.id === activePane;
+        const fileName  = dt.path.split(/[/\\]/).pop() ?? dt.path;
+        const cc        = dt.changeType === "created" ? C.green : dt.changeType === "deleted" ? C.redBright : C.amber;
+        return (
+          <div key={dt.id} onClick={() => onSelect(dt.id)}
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 8px 0 11px", minWidth: 100, maxWidth: 200, cursor: "pointer", flexShrink: 0, background: isActive ? C.bg0 : "transparent", borderRight: `1px solid ${C.border}`, borderBottom: isActive ? `2px solid ${cc}` : "2px solid transparent", transition: "background .1s" }}
+            onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.background = C.bg2; }}
+            onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.background = "transparent"; }}>
+            {/* small colour dot for change type */}
+            <span style={{ width: 6, height: 6, borderRadius: 2, background: cc, flexShrink: 0 }} />
+            <span style={{ fontSize: 11, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: isActive ? C.t0 : C.t2, fontFamily: MONO }}>{fileName}</span>
+            <button onClick={e => { e.stopPropagation(); onCloseDiff(dt.id); }}
+              style={{ ...tbtn, fontSize: 12, opacity: isActive ? 0.6 : 0, padding: "0 1px", flexShrink: 0 }}
+              onMouseEnter={e => { (e.currentTarget as HTMLElement).style.opacity = "1"; (e.currentTarget as HTMLElement).style.color = C.redBright; }}
+              onMouseLeave={e => { (e.currentTarget as HTMLElement).style.opacity = isActive ? "0.6" : "0"; (e.currentTarget as HTMLElement).style.color = C.t2; }}>×</button>
+          </div>
+        );
+      })}
+
       <button onClick={onNewTerm} title="New terminal"
         style={{ ...tbtn, padding: "0 12px", fontSize: 17, fontWeight: 300, borderRight: `1px solid ${C.border}`, borderRadius: 0, flexShrink: 0 }}
         onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = C.tealText}
         onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = C.t2}>+</button>
       <div style={{ flex: 1 }} />
-
     </div>
   );
 }
@@ -494,15 +651,44 @@ interface TermRect { left: number; top: number; width: number; height: number; }
 // ─────────────────────────────────────────────────────────────────────────────
 //  RunboxView
 // ─────────────────────────────────────────────────────────────────────────────
-function RunboxView({ runbox, onCwdChange }: { runbox: Runbox; onCwdChange: (cwd: string) => void }) {
+function RunboxView({ runbox, onCwdChange, onOpenDiff }: {
+  runbox: Runbox;
+  onCwdChange: (cwd: string) => void;
+  onOpenDiff:  (ref: { open: (fc: { path: string; diff: string; change_type: string; insertions: number; deletions: number }) => void }) => void;
+}) {
   const firstLeaf = useRef(newLeaf());
   const [paneRoot,   setPaneRoot]   = useState<PaneNode>(() => firstLeaf.current);
   const [activePane, setActivePane] = useState<string>(() => firstLeaf.current.id);
   const [paneCwds,   setPaneCwds]   = useState<Record<string, string>>({});
+  const [diffTabs,   setDiffTabs]   = useState<DiffTab[]>([]);
   const slotMapRef = useRef<Record<string, HTMLDivElement>>({});
   const [termRects,  setTermRects]  = useState<Record<string, TermRect>>({});
   const wrapperRef = useRef<HTMLDivElement>(null);
   const leafIds = collectIds(paneRoot);
+
+  // Expose openDiffTab to parent (RunboxManager) via callback ref pattern
+  useEffect(() => {
+    onOpenDiff({
+      open: (fc) => {
+        setDiffTabs(prev => {
+          // If a tab for this path already exists, just activate it
+          const existing = prev.find(t => t.path === fc.path);
+          if (existing) { setActivePane(existing.id); return prev; }
+          const id = `diff-${Date.now()}`;
+          setActivePane(id);
+          return [...prev, {
+            id,
+            path:       fc.path,
+            diff:       fc.diff,
+            changeType: fc.change_type,
+            insertions: fc.insertions,
+            deletions:  fc.deletions,
+            openedAt:   Date.now(),
+          }];
+        });
+      }
+    });
+  }, [onOpenDiff]);
 
   const onSlotMount   = useCallback((id: string, el: HTMLDivElement) => { slotMapRef.current[id] = el; }, []);
   const onSlotUnmount = useCallback((id: string) => { delete slotMapRef.current[id]; }, []);
@@ -535,18 +721,46 @@ function RunboxView({ runbox, onCwdChange }: { runbox: Runbox; onCwdChange: (cwd
     });
   }, []);
 
+  const handleCloseDiff = useCallback((id: string) => {
+    setDiffTabs(prev => {
+      const next = prev.filter(t => t.id !== id);
+      setActivePane(ap => {
+        if (ap !== id) return ap;
+        // Fall back to first terminal or another diff tab
+        return next[next.length - 1]?.id ?? leafIds[0] ?? ap;
+      });
+      return next;
+    });
+  }, [leafIds]);
+
   const doSplit = useCallback((id: string, dir: SplitDir) => {
     setPaneRoot(prev => { const added = newLeaf(); setActivePane(added.id); return splitLeaf(prev, id, dir, added); });
   }, []);
 
-  const effectiveCwd = runbox.cwd;
+  const effectiveCwd   = runbox.cwd;
+  const activeDiffTab  = diffTabs.find(t => t.id === activePane) ?? null;
+  const isTerminalPane = leafIds.includes(activePane);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
-      <TermTabBar leafIds={leafIds} activePane={activePane} paneCwds={paneCwds}
-        runboxCwd={effectiveCwd}
-        onSelect={setActivePane} onNewTerm={() => doSplit(activePane, "h")} onClose={handleClose} />
-      <div ref={wrapperRef} style={{ flex: 1, display: "flex", minHeight: 0, background: C.bg0, position: "relative" }}>
+      <TermTabBar
+        leafIds={leafIds} activePane={activePane} paneCwds={paneCwds}
+        runboxCwd={effectiveCwd} diffTabs={diffTabs}
+        onSelect={id => setActivePane(id)}
+        onNewTerm={() => doSplit(activePane, "h")}
+        onClose={handleClose}
+        onCloseDiff={handleCloseDiff}
+      />
+
+      {/* Active diff tab — shown full-area when a diff tab is active */}
+      {activeDiffTab && (
+        <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+          <DiffTabView tab={activeDiffTab} />
+        </div>
+      )}
+
+      {/* Terminal pane tree — always rendered but hidden when a diff tab is active so terminals stay alive */}
+      <div ref={wrapperRef} style={{ flex: 1, display: isTerminalPane ? "flex" : "none", minHeight: 0, background: C.bg0, position: "relative" }}>
         <PaneTree node={paneRoot} activePane={activePane}
           onActivate={setActivePane} onClose={handleClose}
           onSplitH={id => doSplit(id, "h")} onSplitV={id => doSplit(id, "v")}
@@ -710,6 +924,8 @@ export default function RunboxManager() {
   const [cwdMap,           setCwdMap]           = useState<Record<string, string>>({});
   const [browserOpen,      setBrowserOpen]      = useState(false);
   const [memoryOpen,       setMemoryOpen]       = useState(false);
+  const [filesOpen,        setFilesOpen]        = useState(false);
+  const [fileCount,        setFileCount]        = useState(0);
   const [memWidth,         setMemWidth]         = useState(320);
   const [pendingUrl,       setPendingUrl]       = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -723,11 +939,36 @@ export default function RunboxManager() {
     return () => { unsub.then(f => f()); };
   }, []);
 
+  // Track file change count for badge — refresh when active runbox changes
+  useEffect(() => {
+    if (!activeId) { setFileCount(0); return; }
+    const rb = runboxes.find(r => r.id === activeId);
+    if (!rb) { setFileCount(0); return; }
+    const cwd = cwdMap[activeId] || rb.cwd;
+    invoke<{ path: string }[]>("git_diff_live", { cwd, runboxId: activeId })
+      .then(files => setFileCount(files.length))
+      .catch(() => setFileCount(0));
+  }, [activeId, cwdMap]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    const unsub = listen<{ runbox_id: string }>("file-changed", ({ payload }) => {
+      if (payload.runbox_id !== activeId) return;
+      const rb = runboxes.find(r => r.id === activeId);
+      if (!rb) return;
+      const cwd = cwdMap[activeId] || rb.cwd;
+      invoke<{ path: string }[]>("git_diff_live", { cwd, runboxId: activeId })
+        .then(files => setFileCount(files.length))
+        .catch(() => {});
+    });
+    return () => { unsub.then(f => f()); };
+  }, [activeId, cwdMap, runboxes]);
+
 
   useEffect(() => { saveRunboxes(runboxes); }, [runboxes]);
 
   // Only one right panel open at a time (except browser which is separate)
-  const closeSidePanels = () => { setMemoryOpen(false); };
+  const closeSidePanels = () => { setMemoryOpen(false); setFilesOpen(false); };
 
   const onCreate = useCallback(async (name: string, cwd: string) => {
     const id = crypto.randomUUID();
@@ -755,6 +996,9 @@ export default function RunboxManager() {
 
   const safeId       = runboxes.find(r => r.id === activeId)?.id ?? runboxes[0]?.id ?? null;
   const activeRb     = runboxes.find(r => r.id === safeId);
+
+  // Ref map: runboxId → { open } function exposed by RunboxView
+  const diffOpenerRefs = useRef<Record<string, { open: (fc: any) => void }>>({});
 
   // Memory panel drag resize
   const memDragRef = useRef<{ sx: number; sw: number } | null>(null);
@@ -785,6 +1029,12 @@ export default function RunboxManager() {
         ─────────────────────────────────────────────────────────────────── */}
         <div style={{ position: "absolute", top: 4, right: 10, zIndex: 100, display: "flex", alignItems: "center", gap: 4 }}>
 
+          {/* File Changes */}
+          <ToolBtn on={filesOpen} title="File Changes" badge={fileCount}
+            onClick={() => { const o = !filesOpen; closeSidePanels(); setFilesOpen(o); }}>
+            <IcoFiles on={filesOpen} />
+          </ToolBtn>
+
           {/* Memory */}
           <ToolBtn on={memoryOpen} title="Memory"
             onClick={() => { const o = !memoryOpen; closeSidePanels(); setMemoryOpen(o); }}>
@@ -795,7 +1045,11 @@ export default function RunboxManager() {
         {/* Runboxes */}
         {runboxes.map(rb => (
           <div key={rb.id} style={{ display: safeId === rb.id ? "flex" : "none", flex: 1, flexDirection: "column", minHeight: 0 }}>
-            <RunboxView runbox={rb} onCwdChange={cwd => setCwdMap(p => ({ ...p, [rb.id]: cwd }))} />
+            <RunboxView
+              runbox={rb}
+              onCwdChange={cwd => setCwdMap(p => ({ ...p, [rb.id]: cwd }))}
+              onOpenDiff={ref => { diffOpenerRefs.current[rb.id] = ref; }}
+            />
           </div>
         ))}
 
@@ -826,6 +1080,35 @@ export default function RunboxManager() {
           <MemoryPanel runboxId={activeRb.id} runboxName={activeRb.name}
             runboxes={runboxes.map(r => ({ id: r.id, name: r.name }))}
             onClose={() => setMemoryOpen(false)} />
+        </div>
+      )}
+
+      {/* File Changes */}
+      {filesOpen && activeRb && (
+        <div style={{ width: memWidth, flexShrink: 0, display: "flex", flexDirection: "column", background: C.bg1, borderLeft: `1px solid ${C.border}`, position: "relative" }}>
+          <div onMouseDown={onMemDragDown}
+            style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 4, cursor: "col-resize", zIndex: 30, transition: "background .15s" }}
+            onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = C.tealBorder}
+            onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = "transparent"} />
+          {/* Panel header */}
+          <div style={{ padding: "11px 14px 10px", flexShrink: 0, borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 8 }}>
+            <IcoFiles on />
+            <span style={{ fontSize: 13, fontWeight: 600, color: C.t0, flex: 1, fontFamily: SANS }}>File Changes</span>
+            <button onClick={() => setFilesOpen(false)}
+              style={{ background: "none", border: "none", color: C.t2, cursor: "pointer", fontSize: 16, padding: "2px 5px", borderRadius: 4, lineHeight: 1 }}
+              onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = C.t0}
+              onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = C.t2}>×</button>
+          </div>
+          <div style={{ flex: 1, overflowY: "auto", padding: "12px 12px 16px" }}>
+            <FileChangeList
+              runboxId={activeRb.id}
+              runboxCwd={cwdMap[activeRb.id] || activeRb.cwd}
+              onFileClick={fc => {
+                diffOpenerRefs.current[activeRb.id]?.open(fc);
+                setFilesOpen(false);
+              }}
+            />
+          </div>
         </div>
       )}
 

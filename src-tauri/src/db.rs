@@ -1,5 +1,5 @@
 // src-tauri/src/db.rs
-// rusqlite — runboxes, sessions, file_changes, pane_layouts
+// rusqlite — runboxes, sessions, pane_layouts, session_events (FTS5)
 
 use rusqlite::{Connection, Result, params};
 use serde::{Deserialize, Serialize};
@@ -9,23 +9,23 @@ use std::sync::{Arc, Mutex};
 // ── Public handle ─────────────────────────────────────────────────────────
 pub type Db = Arc<Mutex<Connection>>;
 
-// ── Row types (serialized to frontend) ───────────────────────────────────
+// ── Row types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Runbox {
-    pub id:           String,
-    pub name:         String,
-    pub cwd:          String,
-    pub branch:       Option<String>,
-    pub created_at:   i64,
-    pub updated_at:   i64,
+    pub id:         String,
+    pub name:       String,
+    pub cwd:        String,
+    pub branch:     Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Session {
     pub id:         String,
     pub runbox_id:  String,
-    pub pane_id:    String,   // frontend pane id (e.g. "t1", "t2")
+    pub pane_id:    String,
     pub agent:      String,
     pub cwd:        String,
     pub started_at: i64,
@@ -35,23 +35,26 @@ pub struct Session {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct FileChange {
-    pub id:          i64,
-    pub session_id:  String,
-    pub runbox_id:   String,
-    pub file_path:   String,
-    pub change_type: String,  // "created" | "modified" | "deleted"
-    pub diff:        Option<String>,
-    pub timestamp:   i64,
-}
-
-// Stores the full pane tree JSON per runbox so layout is restored on reopen
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PaneLayout {
     pub runbox_id:   String,
-    pub layout_json: String,  // serialised PaneNode tree from frontend
+    pub layout_json: String,
     pub active_pane: String,
     pub updated_at:  i64,
+}
+
+/// A structured event capturing agent activity — powers FTS5 BM25 search.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionEvent {
+    pub id:         String,
+    pub runbox_id:  String,
+    pub session_id: String,
+    /// "session_start" | "session_end" | "memory" | "file_change" | "git"
+    pub event_type: String,
+    /// Short human-readable summary — indexed by FTS5
+    pub summary:    String,
+    /// Optional full content (long diff text, raw output, etc.)
+    pub detail:     Option<String>,
+    pub timestamp:  i64,
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────
@@ -74,14 +77,15 @@ pub fn open() -> Result<Db> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
+    // Core tables
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS runboxes (
-            id            TEXT PRIMARY KEY,
-            name          TEXT NOT NULL,
-            cwd           TEXT NOT NULL,
-            branch        TEXT,
-            created_at    INTEGER NOT NULL,
-            updated_at    INTEGER NOT NULL
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            cwd        TEXT NOT NULL,
+            branch     TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS sessions (
@@ -96,16 +100,6 @@ fn migrate(conn: &Connection) -> Result<()> {
             log_path   TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS file_changes (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id  TEXT NOT NULL,
-            runbox_id   TEXT NOT NULL,
-            file_path   TEXT NOT NULL,
-            change_type TEXT NOT NULL,
-            diff        TEXT,
-            timestamp   INTEGER NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS pane_layouts (
             runbox_id   TEXT PRIMARY KEY REFERENCES runboxes(id) ON DELETE CASCADE,
             layout_json TEXT NOT NULL,
@@ -113,10 +107,59 @@ fn migrate(conn: &Connection) -> Result<()> {
             updated_at  INTEGER NOT NULL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_sessions_runbox   ON sessions(runbox_id);
-        CREATE INDEX IF NOT EXISTS idx_filechanges_runbox ON file_changes(runbox_id);
-        CREATE INDEX IF NOT EXISTS idx_filechanges_session ON file_changes(session_id);
-    ")
+        CREATE INDEX IF NOT EXISTS idx_sessions_runbox ON sessions(runbox_id);
+    ")?;
+
+    // Session events table — powers context-mode-style BM25 retrieval
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS session_events (
+            id         TEXT PRIMARY KEY,
+            runbox_id  TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            event_type TEXT NOT NULL,
+            summary    TEXT NOT NULL,
+            detail     TEXT,
+            timestamp  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_runbox    ON session_events(runbox_id);
+        CREATE INDEX IF NOT EXISTS idx_events_runbox_ts ON session_events(runbox_id, timestamp DESC);
+    ")?;
+
+    // FTS5 virtual table — BM25 ranked search over summary + detail
+    // Must be separate from the CREATE TABLE above because SQLite's execute_batch
+    // stops on certain DDL errors if the virtual table already exists, so we guard
+    // the creation in Rust instead.
+    let fts_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_events_fts'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+
+    if !fts_exists {
+        conn.execute_batch("
+            CREATE VIRTUAL TABLE session_events_fts USING fts5(
+                summary,
+                detail,
+                content='session_events',
+                content_rowid='rowid',
+                tokenize='porter ascii'
+            );
+
+            -- Keep FTS index in sync automatically
+            CREATE TRIGGER events_ai AFTER INSERT ON session_events BEGIN
+                INSERT INTO session_events_fts(rowid, summary, detail)
+                VALUES (new.rowid, new.summary, new.detail);
+            END;
+
+            CREATE TRIGGER events_ad AFTER DELETE ON session_events BEGIN
+                INSERT INTO session_events_fts(session_events_fts, rowid, summary, detail)
+                VALUES ('delete', old.rowid, old.summary, old.detail);
+            END;
+        ")?;
+    }
+
+    Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -176,7 +219,6 @@ pub fn runbox_delete(db: &Db, id: &str) -> Result<()> {
     Ok(())
 }
 
-
 // ── Session CRUD ──────────────────────────────────────────────────────────
 
 pub fn session_start(db: &Db, id: &str, runbox_id: &str, pane_id: &str, agent: &str, cwd: &str) -> Result<()> {
@@ -210,8 +252,8 @@ pub fn sessions_for_runbox(db: &Db, runbox_id: &str) -> Result<Vec<Session>> {
         pane_id:    r.get(2)?,
         agent:      r.get(3)?,
         cwd:        r.get(4)?,
-        started_at: r.get(4)?,
-        ended_at:   r.get(5)?,
+        started_at: r.get(5)?,
+        ended_at:   r.get(6)?,
         exit_code:  r.get(7)?,
         log_path:   r.get(8)?,
     }))?;
@@ -249,39 +291,108 @@ pub fn layout_get(db: &Db, runbox_id: &str) -> Result<Option<PaneLayout>> {
     Ok(rows.next().transpose()?)
 }
 
-// ── File changes ──────────────────────────────────────────────────────────
+// ── Session events CRUD ───────────────────────────────────────────────────
 
-pub fn file_change_insert(
-    db: &Db,
+/// Insert one event and update the FTS5 index automatically via trigger.
+pub fn event_insert(
+    db:         &Db,
+    runbox_id:  &str,
     session_id: &str,
-    runbox_id: &str,
-    file_path: &str,
-    change_type: &str,
-    diff: Option<&str>,
+    event_type: &str,
+    summary:    &str,
+    detail:     Option<&str>,
 ) -> Result<()> {
+    let id  = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
     let conn = db.lock().unwrap();
     conn.execute(
-        "INSERT INTO file_changes (session_id, runbox_id, file_path, change_type, diff, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![session_id, runbox_id, file_path, change_type, diff, now_ms()],
+        "INSERT INTO session_events (id, runbox_id, session_id, event_type, summary, detail, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, runbox_id, session_id, event_type, summary, detail, now],
     )?;
     Ok(())
 }
 
-pub fn file_changes_for_runbox(db: &Db, runbox_id: &str) -> Result<Vec<FileChange>> {
+/// BM25 full-text search over events for a runbox.
+/// Falls back to `events_recent` when the query is empty or produces no hits.
+pub fn events_search(db: &Db, runbox_id: &str, query: &str, limit: usize) -> Result<Vec<SessionEvent>> {
+    if query.trim().is_empty() {
+        return events_recent(db, runbox_id, limit);
+    }
+
+    // Sanitise the FTS5 query: strip special chars that would cause parse errors
+    let safe_query = query
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-')
+        .collect::<String>();
+
+    if safe_query.trim().is_empty() {
+        return events_recent(db, runbox_id, limit);
+    }
+
+    // Scope conn + stmt so they drop before the fallback call below.
+    let results: Vec<SessionEvent> = {
+        let conn = db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.runbox_id, e.session_id, e.event_type, e.summary, e.detail, e.timestamp
+             FROM session_events e
+             JOIN session_events_fts fts ON e.rowid = fts.rowid
+             WHERE e.runbox_id = ?1
+               AND session_events_fts MATCH ?2
+             ORDER BY bm25(session_events_fts)
+             LIMIT ?3"
+        )?;
+        let rows = stmt.query_map(
+            params![runbox_id, safe_query, limit as i64],
+            event_from_row,
+        )?;
+        rows.filter_map(|r| r.ok()).collect()
+    }; // conn and stmt drop here, releasing the mutex lock
+
+    // If BM25 returned nothing (rare with porter tokeniser), fall back to recents
+    if results.is_empty() {
+        return events_recent(db, runbox_id, limit);
+    }
+
+    Ok(results)
+}
+
+/// Most-recent N events for a runbox — used as fallback when FTS has no query.
+pub fn events_recent(db: &Db, runbox_id: &str, limit: usize) -> Result<Vec<SessionEvent>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, runbox_id, file_path, change_type, diff, timestamp
-         FROM file_changes WHERE runbox_id=?1 ORDER BY timestamp DESC LIMIT 500"
+        "SELECT id, runbox_id, session_id, event_type, summary, detail, timestamp
+         FROM session_events
+         WHERE runbox_id = ?1
+         ORDER BY timestamp DESC
+         LIMIT ?2"
     )?;
-    let rows = stmt.query_map(params![runbox_id], |r| Ok(FileChange {
-        id:          r.get(0)?,
-        session_id:  r.get(1)?,
-        runbox_id:   r.get(2)?,
-        file_path:   r.get(3)?,
-        change_type: r.get(4)?,
-        diff:        r.get(4)?,
-        timestamp:   r.get(5)?,
-    }))?;
+    let rows = stmt.query_map(params![runbox_id, limit as i64], event_from_row)?;
     rows.collect()
+}
+
+/// All events for a session (used for session-end summaries).
+pub fn events_for_session(db: &Db, session_id: &str, limit: usize) -> Result<Vec<SessionEvent>> {
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, runbox_id, session_id, event_type, summary, detail, timestamp
+         FROM session_events
+         WHERE session_id = ?1
+         ORDER BY timestamp DESC
+         LIMIT ?2"
+    )?;
+    let rows = stmt.query_map(params![session_id, limit as i64], event_from_row)?;
+    rows.collect()
+}
+
+fn event_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+    Ok(SessionEvent {
+        id:         r.get(0)?,
+        runbox_id:  r.get(1)?,
+        session_id: r.get(2)?,
+        event_type: r.get(3)?,
+        summary:    r.get(4)?,
+        detail:     r.get(5)?,
+        timestamp:  r.get(6)?,
+    })
 }
